@@ -1,0 +1,302 @@
+diff --git a/home/yixingx/jinzeli2/FLy/lm_eval/models/revise_decoding_new.py b/home/yixingx/jinzeli2/FLy/lm_eval/models/revise_decoding_dual_tokenizer.py
+index d86106c..e3953d5 100644
+--- a/home/yixingx/jinzeli2/FLy/lm_eval/models/revise_decoding_new.py
++++ b/home/yixingx/jinzeli2/FLy/lm_eval/models/revise_decoding_dual_tokenizer.py
+@@ -54,11 +54,16 @@ def sample_with_temperature(logits, temp=0, sample_times=1):
+ 
+ 
+ 
++
++
++
++
+ class SPDGenerate:
+-    def __init__(self, draft_model, target_model, tokenizer, cuslog, spd_args):
++    def __init__(self, draft_model, target_model, tokenizer, draft_tokenizer, cuslog, spd_args):
+         self.draft_model = draft_model.eval()
+         self.target_model = target_model.eval()
+-        self.tokenizer = tokenizer
++        self.target_tokenizer = tokenizer
++        self.draft_tokenizer = draft_tokenizer
+         self.cuslog = cuslog
+         self.k = spd_args.get("k")
+         self.total_gen_tok = spd_args.get("total_gen_tok")
+@@ -92,8 +97,6 @@ class SPDGenerate:
+ 
+         self.verbose = spd_args.get("verbose", False)
+ 
+-        self.abla_no_window = spd_args.get("abla_no_window", False)
+-
+ 
+ 
+     def _ensure_counters(self, device: torch.device):
+@@ -550,29 +553,68 @@ class SPDGenerate:
+         return newly_gen_ids
+ 
+ 
++    def enc(self, tok, text):
++        out = tok(text, add_special_tokens=False, return_tensors="pt")
++        return out["input_ids"]
++
++    def dec(self, tok, ids):
++        return tok.batch_decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
++
++    
++
++    def gen_input_context(self, user_cont, assis_cont, tok):
++        msgs = [{"role": "user", "content": user_cont}]
++        contexts = tok.apply_chat_template(
++            msgs, 
++            add_generation_prompt=True, 
++            tokenize=False
++        )
++        contexts_new = contexts + assis_cont
++        contexts_new = contexts_new.replace("<think>", "<think>\n\n</think>\n\nFinal answer:")
++        contexts = (contexts_new,)
++        return contexts
++
++    def replace_draft_eos(self, text, draft_tokenizer, target_tokenizer):
++        draft_eos = draft_tokenizer.eos_token
++        target_eos = target_tokenizer.eos_token
++        if draft_eos is None or target_eos is None:
++            return text
++        return [s.replace(draft_eos, target_eos) if isinstance(s, str) else s for s in text]
++
+ 
+     @torch.no_grad()
+-    def generate_chunks(self, input_ids, temperature):
+-        init_len = input_ids.shape[1]
++    def generate_chunks(self, input_text, temperature):
++        user_cont, assis_cont = input_text
++        input_text_d = self.gen_input_context(user_cont, assis_cont, self.draft_tokenizer)
++        input_text_t = self.gen_input_context(user_cont, assis_cont, self.target_tokenizer)
++
++        input_ids_draft = self.enc(self.draft_tokenizer, input_text_d)
++        init_len_draft = input_ids_draft.shape[1]
++        input_ids_draft = input_ids_draft.to(self.draft_model.device)
++
++        input_ids_target = self.enc(self.target_tokenizer, input_text_t)
++        init_len_target = input_ids_target.shape[1]
++        input_ids_target = input_ids_target.to(self.draft_model.device)
++
++
+         self.reset_counter()
+-        # self.start_time = time.time()
++        
+ 
+-        input_ids = input_ids.to(self.draft_model.device)  # jz0819
+         # Prefill
+-        out_d = self.draft_model(input_ids[:, :-1], use_cache=True, return_dict=True)
++        out_d = self.draft_model(input_ids_draft[:, :-1], use_cache=True, return_dict=True)
+         past_kv_draft = out_d.past_key_values
+-        out_t = self.target_model(input_ids[:, :-1], use_cache=True, return_dict=True)
++        out_t = self.target_model(input_ids_target[:, :-1], use_cache=True, return_dict=True)
+         past_kv_target = out_t.past_key_values
+ 
+-        seed_for_next_d = input_ids[:, -1:]  # shape [1,1]
+-        seed_for_next_t = input_ids[:, -1:]
+-        
++        seed_for_next_d = input_ids_draft[:, -1:]  # shape [1,1]
++        seed_for_next_t = input_ids_target[:, -1:]
++
+         self.start_time = time.time()
+         if self.k == 0:
+             outputs = self.target_model.generate(
+-                input_ids=input_ids,
++                input_ids=input_ids_target,
+                 max_new_tokens=self.total_gen_tok,
+-                pad_token_id=self.tokenizer.pad_token_id,
++                pad_token_id=self.target_tokenizer.pad_token_id,
+                 use_cache=True,
+                 past_key_values=past_kv_target,
+                 do_sample=True if temperature > 0 else False,
+@@ -580,25 +622,25 @@ class SPDGenerate:
+                 )
+             
+             if self.verbose:
+-                self.cuslog.info(f">>>new output:{self.tokenizer.decode(outputs[0])}")
++                self.cuslog.info(f">>>new output:{self.target_tokenizer.decode(outputs[0])}")
+             # self.cuslog.info(f">>>generation_config:{self.target_model.generation_config.to_dict()}") 
+ 
+             self.end_time = time.time()
+-            self.num_emitted_tokens = torch.tensor(outputs.shape[1] - init_len)
+-            self.num_draft_round = torch.tensor(outputs.shape[1] - init_len)
++            self.num_emitted_tokens = torch.tensor(outputs.shape[1] - init_len_target)
++            self.num_draft_round = torch.tensor(outputs.shape[1] - init_len_target)
+             self.num_accepted_tokens = 0
+ 
+             return outputs
+ 
+ 
+         draft_round = 0
+-        while (input_ids.shape[1] - init_len) < self.total_gen_tok:
++        while (input_ids_target.shape[1] - init_len_target) < self.total_gen_tok:
+             draft_round += 1
+ 
+             # self.cuslog.info(f"[{draft_round}]jz0803ngram is {self.use_ngram} InputIds>>> {self.decode_ids(input_ids[:,-20:])}")
+ 
+             if self.use_ngram:
+-                draft_token_ids = self.draft_with_ngram(input_ids, past_kv_draft, 0)
++                draft_token_ids = self.draft_with_ngram(input_ids_draft, past_kv_draft, 0)
+                 draft_token_ids = draft_token_ids[:,:self.k]
+ 
+             else:
+@@ -616,20 +658,27 @@ class SPDGenerate:
+ 
+                 draft_token_ids = torch.cat(draft_token_ids, dim=1)  # [1, k]
+ 
+-
++            # self.cuslog.info(f"{draft_token_ids.shape=}")
+             # self.cuslog.info(f"[{draft_round}] ngram is {self.use_ngram} Prompt>>> {self.decode_ids(input_ids)}")
+             # self.cuslog.info(f"[{draft_round}]jz0803ngram is {self.use_ngram} NewlyGen>>> {self.decode_ids(draft_token_ids)}")
+ 
+-            target_in = torch.cat([seed_for_next_t, draft_token_ids], dim=1)  # [1, k+1]
++            # jz0913
++            draft_token_text = self.dec(self.draft_tokenizer, draft_token_ids)
++            draft_token_text = self.replace_draft_eos(draft_token_text, self.draft_tokenizer, self.target_tokenizer)
++            target_in_ids = self.enc(self.target_tokenizer, draft_token_text)
++            target_in_ids = target_in_ids.to(self.draft_model.device)
++
++            # self.cuslog.info(f"{draft_token_text=}")
++
++            # self.cuslog.info(f"{seed_for_next_t.device=}, {target_in_ids.device=}")
++            target_in = torch.cat([seed_for_next_t, target_in_ids], dim=1)  # [1, k+1]
+             target_outputs = self.target_model(input_ids=target_in, past_key_values=past_kv_target, use_cache=True, return_dict=True)
+            
+-            current_k = draft_token_ids.shape[1]
++            current_k = target_in_ids.shape[1]
++            # self.cuslog.info(f"{current_k=}")
+ 
+             # self.cuslog.info(f"[{draft_round}] current_k is {current_k}")
+-
+-
+             # target 每个草稿位置的 logits（不含最后 bonus 位置）
+-            # target_logits_k = target_outputs.logits[:, -(current_k+1):-1, :]  # [B, k, V]
+             target_logits_k = target_outputs.logits[:, :-1, :][:, -current_k:, :]
+ 
+             # bonus token：最后一步的 argmax
+@@ -639,7 +688,7 @@ class SPDGenerate:
+ 
+             accepted, recovered_token_ids = self._batch_verification(
+                 target_logits_k,        # [B, k, V]
+-                draft_token_ids,        # [B, k]
++                target_in_ids,        # [B, k]
+                 temperature,
+             )
+ 
+@@ -649,10 +698,11 @@ class SPDGenerate:
+             if self.entropy_thre:
+                 rej_mask = self.rej_by_entropy(accepted, target_logits_k, self.entropy_thre)
+ 
+-            if self.revise_decoding:
++            if self.revise_decoding and current_k > self.win_len:
+                 self.pattern = torch.ones(self.win_len, dtype=torch.bool, device=accepted.device)
+                 self.pattern[0] = False
+-
++                # self.cuslog.info(f"{accepted=}")
++                # self.cuslog.info(f"{accepted.shape=}")
+                 unfold_accept = accepted.unfold(1, self.win_len, 1)
+                 matched = torch.all(unfold_accept==self.pattern, dim=-1)
+ 
+@@ -667,48 +717,60 @@ class SPDGenerate:
+ 
+             if self.entropy_thre:
+                 accepted = accepted & rej_mask
+-
+-            if self.abla_no_window:
+-                accepted = rej_mask
+             
+             
+             # shape [1, valid_len]
+-            newly_input_ids = self._create_output(
++            newly_gen_ids = self._create_output(
+                     accepted,
+                     recovered_token_ids,
+-                    draft_token_ids,
++                    target_in_ids,
+                     bonus_token_ids,
+                     update_counter=True,
+                 )
+             
+             
+-            input_ids = torch.cat([input_ids, newly_input_ids], dim=-1)
+-            # kv_keep = input_ids.shape[1] - 1
+-
+-            # len_before_crop = past_kv_target.get_seq_length()
+-            # self.cuslog.info(f"[{draft_round}]past_kv_target Length >>> {past_kv_target.get_seq_length()}")
+-            # past_kv_target.crop(int(kv_keep))
+-            # past_kv_draft.crop(int(kv_keep))
+-
+-            if accepted.all():
+-                self.bonus_tok_from_target = 2
+-                past_kv_draft.crop(int(input_ids.shape[1]-2))
+-                seed_for_next_d = input_ids[:,-2:]
+-            else:
+-                self.bonus_tok_from_target = 1
+-                past_kv_draft.crop(int(input_ids.shape[1]-1))
+-                seed_for_next_d = input_ids[:,-1:]
++            input_ids_target = torch.cat([input_ids_target, newly_gen_ids], dim=-1)
++            
++            newly_gen_text = self.dec(self.target_tokenizer, newly_gen_ids)
++
++            
++
++
++            new_input_ids_draft = self.enc(self.draft_tokenizer, newly_gen_text).to(self.draft_model.device)
++            seed_for_next_d = new_input_ids_draft
++
++            draft_kv_len = int(input_ids_draft.shape[1])
++            past_kv_draft.crop(draft_kv_len)
++            input_ids_draft = torch.cat([input_ids_draft, new_input_ids_draft], dim=-1)
++            
++            self.bonus_tok_from_target = seed_for_next_d.shape[1]
+ 
+-            past_kv_target.crop(int(input_ids.shape[1] - 1))
+-            seed_for_next_t = input_ids[:,-1:]
++
++            # if accepted.all():
++            #     self.bonus_tok_from_target = 2
++            #     past_kv_draft.crop(int(input_ids.shape[1]-2))
++            #     seed_for_next_d = input_ids[:,-2:]
++            # else:
++            #     self.bonus_tok_from_target = 1
++            #     past_kv_draft.crop(int(input_ids.shape[1]-1))
++            #     seed_for_next_d = input_ids[:,-1:]
++
++            past_kv_target.crop(int(input_ids_target.shape[1] - 1))
++            seed_for_next_t = input_ids_target[:,-1:]
+ 
+             # self.cuslog.info(f"[{draft_round}]current mat >>> {newly_input_ids.shape[1]}")
+             # self.cuslog.info(f"[{draft_round}]jz0803current round generate >>> {self.decode_ids(newly_input_ids)}")
+ 
+-            eos_found_mask = (newly_input_ids == self.tokenizer.eos_token_id) 
++            eos_found_mask = (newly_gen_ids == self.target_tokenizer.eos_token_id) 
+             eos_found_in_chunk = torch.any(eos_found_mask)
+             if eos_found_in_chunk:
+                 break
++
++            # jz0914
++            # self.cuslog.info(f"{newly_gen_text=}")
++            # if "```" in newly_gen_text[0]:
++            #     # self.cuslog.info(f"break by ```")
++            #     break
+         
+         self.bonus_tok_from_target = 1
+         self.end_time = time.time()
+@@ -716,7 +778,7 @@ class SPDGenerate:
+ 
+         # self.cuslog.info(f"[{draft_round}]jz0803 >>> {self.decode_ids(input_ids)}")
+ 
+-        return input_ids
++        return input_ids_target
+     
+     
+     def show_status(self):
+@@ -747,6 +809,4 @@ class SPDGenerate:
+     def reset_counter(self):
+         self._counter_inited = False
+     
+-    def decode_ids(self, ids):
+-        token = self.tokenizer.decode(ids[0], skip_special_tokens=False)
+-        return token
++    
