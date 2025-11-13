@@ -739,6 +739,13 @@ class HFLM(TemplateLM):
 
         model_kwargs = kwargs if kwargs else {}
 
+        # Filter out custom configuration parameters that should not be passed to model.from_pretrained
+        # These parameters are handled in __init__ and stored in self.json_config
+        custom_params = set(self.json_config.keys()) if hasattr(self, 'json_config') else set()
+        custom_params.add('config_path')  # Also filter out config_path
+        for param in custom_params:
+            model_kwargs.pop(param, None)  # Remove if exists, ignore if not
+
         model_kwargs.update(
             self._get_accelerate_args(
                 parallelize=parallelize,
