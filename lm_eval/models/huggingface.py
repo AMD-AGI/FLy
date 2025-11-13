@@ -157,6 +157,12 @@ class HFLM(TemplateLM):
                                  f"JSON value: {json_config[key]} -> kwargs value: {kwargs[key]}")
         self.json_config = json_config
 
+        # 打印最终使用的配置（更新后的配置）
+        eval_logger.info("=" * 80)
+        eval_logger.info("Final Configuration (after kwargs updates):")
+        eval_logger.info("=" * 80)
+        eval_logger.info(json.dumps(json_config, indent=2, ensure_ascii=False))
+        eval_logger.info("=" * 80)
 
         # jz0728
         self.target_model_path = json_config["target_model_path"]
