@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export HF_HOME=/shareddata/jinzeli2/cache
+export HF_HOME=/wekafs/jinzeli2/cache
 
 # Model paths
 llama33_70B='meta-llama/Llama-3.3-70B-Instruct'
@@ -12,12 +12,12 @@ llama31_8B='meta-llama/Llama-3.1-8B-Instruct'
 draft_model=${llama31_8B}
 
 # GPU configuration
-export HIP_VISIBLE_DEVICES='4,5,6,7'
+export HIP_VISIBLE_DEVICES='0'
 # export HIP_VISIBLE_DEVICES='4'
 export HF_ALLOW_CODE_EVAL=1
 
 # Parallelization
-para=True
+para=False
 
 # JSON config file path (relative to project root)
 config_path="fly/FLy_Llama3_70b.json"
@@ -40,5 +40,5 @@ python -m lm_eval \
     --apply_chat_template \
     --fewshot_as_multiturn \
     --confirm_run_unsafe_code \
-    &> ./output_log/${data}_${task}_FLy_Llama3_70b.log
+    &> ./output_log/${data}_${task}_FLy_Llama3_70b_2.log
 
