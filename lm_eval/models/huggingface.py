@@ -45,8 +45,9 @@ from lm_eval.models.utils import (
 #jz0728
 # from lm_eval.models.revise_decoding import SPDGenerate
 # from lm_eval.models.revise_decoding_new import SPDGenerate
-from lm_eval.models.revise_decoding_show_one_example import SPDGenerate
+# from lm_eval.models.revise_decoding_show_one_example import SPDGenerate
 # from lm_eval.models.revise_decoding_walltime import SPDGenerate
+from lm_eval.models.FLy import SPDGenerate
 
 # sys.path.insert(0, "/workspace/EAGLE")
 # from eagle.model.ea_model import EaModel
@@ -395,20 +396,20 @@ class HFLM(TemplateLM):
         if self.use_sd:
             eval_logger.info(f"use_sd is True")
             spd_args = {
-                "k":spd_k,
+                "k":self.json_config["spd_k"],
                 "total_gen_tok":total_gen_tok,
-                "revise_decoding":revise_decoding,
-                "win_len":win_len,
-                "entropy_thre":entropy_thre,
-                "use_ngram":use_ngram,
-                "max_ngram_size":max_ngram_size,
-                "num_ngram_pred_tokens":num_ngram_pred_tokens,
-                "verbose":verbose,
-                "abla_no_window":False,
+                "enable_fly":self.json_config["enable_fly"],
+                "win_len":self.json_config["win_len"],
+                "entropy_thre":self.json_config["entropy_thre"],
+                "use_ngram":self.json_config["use_ngram"],
+                "max_ngram_size":self.json_config["max_ngram_size"],
+                "num_ngram_pred_tokens":self.json_config["num_ngram_pred_tokens"],
+                "verbose":self.json_config["verbose"],
+                "abla_no_window":self.json_config["abla_no_window"],
             }
 
             if self.json_config['dual_tok']:
-                self.spd_gen = SPDGenerate(self.model, self.target_model, self.tokenizer, self.draft_tokenizer, eval_logger, spd_args)
+                self.spd_gen = SPDGenerate(self.model, self.target_model, self.tokenizer, eval_logger, spd_args, draft_tokenizer=self.draft_tokenizer)
             else:
                 self.spd_gen = SPDGenerate(self.model, self.target_model, self.tokenizer, eval_logger, spd_args)
 
@@ -429,8 +430,8 @@ class HFLM(TemplateLM):
 
 
             self.eagle_model = EaModel.from_pretrained(
-                                base_model_path=target_model_path,
-                                ea_model_path=ea_model_path,
+                                base_model_path=self.target_model_path,
+                                ea_model_path=self.json_config["ea_model_path"],
                                 total_token=48,
                                 depth=6,
                                 top_k=10,
@@ -1136,7 +1137,7 @@ class HFLM(TemplateLM):
             )
 
     # jz0728
-    def _model_generate_sd(self, context, max_length, stop, **generation_kwargs):
+    def _model_generate_sd(self, context, max_length, stop, attention_mask=None, input_context_for_dualtok=None, **generation_kwargs):
         stopping_criteria = stop_sequences_criteria(
             self.tokenizer, stop, context.shape[1], context.shape[0]
         )

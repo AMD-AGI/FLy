@@ -5,7 +5,7 @@
   "enable_qwen_thinking": true,
   "total_gen_tok": 1024,
   "spd_k": 25,
-  "revise_decoding": false,
+  "enable_fly": false,
   "win_len": 8,
   "entropy_thre": 0.1,
   "use_ngram": true,

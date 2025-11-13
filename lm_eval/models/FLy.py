@@ -55,11 +55,12 @@ def sample_with_temperature(logits, temp=0, sample_times=1):
 
 
 class SPDGenerate:
-    def __init__(self, draft_model, target_model, tokenizer, cuslog, spd_args):
+    def __init__(self, draft_model, target_model, tokenizer, cuslog, spd_args, draft_tokenizer=None):
         self.draft_model = draft_model.eval()
         self.target_model = target_model.eval()
         self.tokenizer = tokenizer
         self.cuslog = cuslog
+        self.draft_tokenizer = draft_tokenizer
         self.k = spd_args.get("k")
         self.total_gen_tok = spd_args.get("total_gen_tok")
 
@@ -76,7 +77,7 @@ class SPDGenerate:
         self.cuslog.info(f"{self.draft_model.device=}, {self.target_model.device=}, {self.target_model.dtype=}")
         self.speed_list, self.mat_list = [], []
 
-        self.revise_decoding = spd_args.get("revise_decoding")
+        self.enable_fly = spd_args.get("enable_fly")
         self.win_len = spd_args.get("win_len")
 
         # self.init_entropy_statistics()
@@ -166,11 +167,11 @@ class SPDGenerate:
             target_probs, draft_probs).reshape(batch_size * k, vocab_size)
 
         # NOTE: the recovered_probs are overwritten by this method.
+        # Reshape recovered_probs to [batch_size, k, vocab_size] for _multinomial
+        recovered_probs_reshaped = recovered_probs.reshape(batch_size, k, vocab_size)
         recovered_token_ids = _multinomial(
-            recovered_probs,
+            recovered_probs_reshaped,
             num_samples=1,
-            k=k,
-            seeded_seqs=seeded_seqs or {},
         ).reshape(batch_size, k)
 
         return accepted, recovered_token_ids
@@ -649,7 +650,7 @@ class SPDGenerate:
             if self.entropy_thre:
                 rej_mask = self.rej_by_entropy(accepted, target_logits_k, self.entropy_thre)
 
-            if self.revise_decoding:
+            if self.enable_fly:
                 self.pattern = torch.ones(self.win_len, dtype=torch.bool, device=accepted.device)
                 self.pattern[0] = False
 
