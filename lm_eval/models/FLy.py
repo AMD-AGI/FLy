@@ -95,6 +95,13 @@ class SPDGenerate:
 
         self.abla_no_window = spd_args.get("abla_no_window", False)
 
+        # 指标统计控制开关
+        self.enable_statistics = spd_args.get("enable_statistics", False)
+        
+        # 初始化统计变量
+        self.total_initial_mismatch = 0  # 初始的 mismatch 总数（accepted 为 False 的数量）
+        self.total_fly_accepted = 0      # 通过 FLy 算法从 False 变成 True 的数量
+
 
 
     def _ensure_counters(self, device: torch.device):
@@ -644,6 +651,10 @@ class SPDGenerate:
                 temperature,
             )
 
+            # 记录应用 FLy 算法前的 accepted 状态（用于统计）
+            if self.enable_statistics:
+                accepted_before_fly = accepted.clone()
+
             # self.entropy_statistics(accepted, draft_probs, target_logits_k, output=(not (draft_round%10)))
             # self.cuslog.info(f"[{draft_round}]recovered_token_ids shape >>> {recovered_token_ids.shape}")
             # self.cuslog.info(f"[{draft_round}]accepted before >>> {accepted}")
@@ -663,8 +674,19 @@ class SPDGenerate:
 
                 updated_accept[:, -self.win_len:] = updated_accept[:, -self.win_len:] & accepted[:, -self.win_len:]
                 
+                # 统计指标：记录 FLy 算法接受的数量（在更新 accepted 之前）
+                if self.enable_statistics:
+                    # 计算从 False 变成 True 的数量
+                    fly_accepted = (~accepted_before_fly) & updated_accept
+                    self.total_fly_accepted += fly_accepted.sum().item()
+                
                 accepted = updated_accept
                 # self.cuslog.info(f"[{draft_round}]accepted after >>> {accepted}")
+            
+            # 统计指标：记录初始 mismatch 数量（在应用 FLy 之前）
+            if self.enable_statistics:
+                initial_mismatch = (~accepted_before_fly).sum().item()
+                self.total_initial_mismatch += initial_mismatch
 
             if self.entropy_thre:
                 accepted = accepted & rej_mask
@@ -736,17 +758,53 @@ class SPDGenerate:
         else:
             mean_ngram_accept = 0
 
-        self.cuslog.info(f"Speed:{speed:.2f}|MAT:{mat:.2f}|ngramMAT:{mean_ngram_accept:.2f}|DraftRound:{self.num_draft_round.cpu().item()}|TotalTok:{self.num_emitted_tokens}|Elapsed:{elapsed:.2f}")
+        status_msg = f"Speed:{speed:.2f}|MAT:{mat:.2f}|ngramMAT:{mean_ngram_accept:.2f}|DraftRound:{self.num_draft_round.cpu().item()}|TotalTok:{self.num_emitted_tokens}|Elapsed:{elapsed:.2f}"
         
-        return {
+        # 如果启用了统计，添加统计信息
+        if self.enable_statistics:
+            fly_accept_rate = (self.total_fly_accepted / self.total_initial_mismatch * 100) if self.total_initial_mismatch > 0 else 0.0
+            total_final_rejected = self.total_initial_mismatch - self.total_fly_accepted
+            status_msg += f"|InitialMismatch:{self.total_initial_mismatch}|FLyAccepted:{self.total_fly_accepted}|FinalRejected:{total_final_rejected}|FLyAcceptRate:{fly_accept_rate:.2f}%"
+        
+        self.cuslog.info(status_msg)
+        
+        result = {
             "accepted": self.num_accepted_tokens,
             "emitted": self.num_emitted_tokens,
             "draft_round": self.num_draft_round,
             "elapsed": elapsed,
         }
+        
+        # 如果启用了统计，添加统计结果
+        if self.enable_statistics:
+            result["initial_mismatch"] = self.total_initial_mismatch
+            result["fly_accepted"] = self.total_fly_accepted
+            result["final_rejected"] = self.total_initial_mismatch - self.total_fly_accepted
+            result["fly_accept_rate"] = (self.total_fly_accepted / self.total_initial_mismatch * 100) if self.total_initial_mismatch > 0 else 0.0
+        
+        return result
+    
+    def get_statistics(self):
+        """获取统计指标"""
+        if not self.enable_statistics:
+            return None
+        
+        fly_accept_rate = (self.total_fly_accepted / self.total_initial_mismatch * 100) if self.total_initial_mismatch > 0 else 0.0
+        total_final_rejected = self.total_initial_mismatch - self.total_fly_accepted
+        
+        return {
+            "total_initial_mismatch": self.total_initial_mismatch,
+            "total_fly_accepted": self.total_fly_accepted,
+            "total_final_rejected": total_final_rejected,
+            "fly_accept_rate": fly_accept_rate,
+        }
     
     def reset_counter(self):
         self._counter_inited = False
+        # 重置统计变量
+        if self.enable_statistics:
+            self.total_initial_mismatch = 0
+            self.total_fly_accepted = 0
     
     def decode_ids(self, ids):
         token = self.tokenizer.decode(ids[0], skip_special_tokens=False)

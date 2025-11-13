@@ -138,6 +138,7 @@ class HFLM(TemplateLM):
         # splits to get response after this token (if provided).
         think_end_token: Union[str, int, None] = None,
         total_gen_tok=1024,
+        enable_statistics: Optional[bool] = False,
         config_path=None,
         **kwargs,
     ) -> None:
@@ -412,6 +413,7 @@ class HFLM(TemplateLM):
                 "num_ngram_pred_tokens":self.json_config["num_ngram_pred_tokens"],
                 "verbose":self.json_config["verbose"],
                 "abla_no_window":self.json_config["abla_no_window"],
+                "enable_statistics":enable_statistics,  # 指标统计开关，从命令行参数传入，默认关闭
             }
 
             if self.json_config['dual_tok']:
