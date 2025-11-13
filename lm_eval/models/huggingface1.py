@@ -1,7 +1,6 @@
 import copy
 import logging
 import os
-import json
 os.environ["HF_TOKEN"] = "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" 
 # os.environ["HF_TOKEN"] = "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"
 import sys
@@ -136,36 +135,38 @@ class HFLM(TemplateLM):
         # end token for thinking, either the string or int token id.
         # splits to get response after this token (if provided).
         think_end_token: Union[str, int, None] = None,
+        target_model_path = None,
+        use_sd = False,
+        is_qwen=False,
+        enable_qwen_thinking=True,
         total_gen_tok=1024,
-        config_path=None,
+        spd_k=25,
+        revise_decoding=False,
+        win_len=8,
+        entropy_thre=0,
+        use_ngram=False,
+        max_ngram_size=3,
+        num_ngram_pred_tokens=10,
+        ea_model_path=None,
+        use_eagle2=False,
+        use_eagle3=False,  # jz0806
+        spec_bench_method="",
+        temperature=0,
+        verbose=False,
         **kwargs,
     ) -> None:
         super().__init__()
         # optionally: take in an already-initialized transformers.PreTrainedModel
         
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Config file not found: {config_path}")
-        else:
-            with open(config_path, "r", encoding="utf-8") as f:
-                json_config = json.load(f)
-        
-        for key in json_config:
-            if key in kwargs:
-                json_config[key] = kwargs[key]
-                eval_logger.info(f"Parameter '{key}' overridden by kwargs. "
-                                 f"JSON value: {json_config[key]} -> kwargs value: {kwargs[key]}")
-        self.json_config = json_config
-
-
         # jz0728
-        self.target_model_path = json_config["target_model_path"]
-        self.use_sd = json_config["use_sd"]
-        self.is_qwen = json_config["is_qwen"]
-        self.use_eagle2 = json_config["use_eagle2"]
-        self.use_eagle3 = json_config["use_eagle3"]
-        self.spec_bench_method = json_config["spec_bench_method"]
-        self.enable_thinking = json_config["enable_qwen_thinking"]
-        self.temperature = json_config["temperature"]
+        self.target_model_path = target_model_path
+        self.use_sd = use_sd
+        self.is_qwen = is_qwen
+        self.use_eagle2 = use_eagle2
+        self.use_eagle3 = use_eagle3
+        self.spec_bench_method = spec_bench_method
+        self.enable_thinking = enable_qwen_thinking
+        self.temperature = temperature
         self.pretrained = pretrained
         
 
@@ -406,20 +407,17 @@ class HFLM(TemplateLM):
                 "verbose":verbose,
                 "abla_no_window":False,
             }
-
-            if self.json_config['dual_tok']:
-                self.spd_gen = SPDGenerate(self.model, self.target_model, self.tokenizer, self.draft_tokenizer, eval_logger, spd_args)
-            else:
-                self.spd_gen = SPDGenerate(self.model, self.target_model, self.tokenizer, eval_logger, spd_args)
+            # self.spd_gen = SPDGenerate(self.model, self.target_model, self.tokenizer, self.draft_tokenizer, eval_logger, spd_args)
+            self.spd_gen = SPDGenerate(self.model, self.target_model, self.tokenizer, eval_logger, spd_args)
 
         # jz0806
         
         elif self.use_eagle3 or self.use_eagle2:
             eval_logger.info(f"use_eagle3 is {self.use_eagle3}, use_eagle2 is {self.use_eagle2}")
             
-            self.totaltoken_list = []
-            self.totaltime_list = []
-            self.round_list = []
+            self.eagle_totaltoken_list = []
+            self.eagle_totaltime_list = []
+            self.eagle_round_list = []
             
 
             if self.use_eagle3:
@@ -441,9 +439,9 @@ class HFLM(TemplateLM):
                             )
         elif len(self.spec_bench_method) > 0:
 
-            self.totaltoken_list = []
-            self.totaltime_list = []
-            self.round_list = []
+            self.eagle_totaltoken_list = []
+            self.eagle_totaltime_list = []
+            self.eagle_round_list = []
 
             self.sb = SpecBenchMethod(self.spec_bench_method, self.target_model, self.tokenizer, total_gen_tok, self.target_model.device)
 
@@ -925,11 +923,10 @@ class HFLM(TemplateLM):
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                 model_name, **kwargs
             )
-            if self.json_config['dual_tok']:
-                draft_name = self.pretrained
-                self.draft_tokenizer = transformers.AutoTokenizer.from_pretrained(
-                    draft_name, **kwargs
-                )
+            draft_name = self.pretrained
+            self.draft_tokenizer = transformers.AutoTokenizer.from_pretrained(
+                draft_name, **kwargs
+            )
         else:
             # Get tokenizer based on 'pretrained'
             if isinstance(pretrained, str):
@@ -1137,6 +1134,17 @@ class HFLM(TemplateLM):
 
     # jz0728
     def _model_generate_sd(self, context, max_length, stop, **generation_kwargs):
+
+        # generation_kwargs["temperature"] = generation_kwargs.get("temperature", 0.0)
+        # do_sample = generation_kwargs.get("do_sample", None)
+
+        # The temperature has to be a strictly positive float -- if it is 0.0, use greedy decoding strategies
+        # if generation_kwargs.get("temperature") == 0.0 and do_sample is None:
+        #     generation_kwargs["do_sample"] = do_sample = False
+
+        # if do_sample is False and generation_kwargs.get("temperature") == 0.0:
+        #     generation_kwargs.pop("temperature")
+        # build stopping criteria
         stopping_criteria = stop_sequences_criteria(
             self.tokenizer, stop, context.shape[1], context.shape[0]
         )
@@ -1146,6 +1154,13 @@ class HFLM(TemplateLM):
             dtype=self.mixed_precision_dtype,
             enabled=self.mixed_precision_dtype is not None,
         ):
+            # accepted_token = self.spd_gen.generate_chunks(
+            #     input_ids=context,
+            #     max_length=max_length,
+            #     stopping_criteria=stopping_criteria,
+            #     pad_token_id=self.tokenizer.pad_token_id,
+            #     generation_kwargs=generation_kwargs, 
+            #     )
             accepted_token = self.spd_gen.generate_chunks(context, self.temperature)
         _ = self.spd_gen.show_status()
         return accepted_token
@@ -1163,7 +1178,7 @@ class HFLM(TemplateLM):
 
         torch.cuda.synchronize()
         total_time = time.time() - start_time
-        self.collect_statistics(total_time,new_tok,idx_plus_1)
+        self.collect_eagle_statistics(total_time,new_tok,idx_plus_1)
 
         return out_ids
 
@@ -1184,20 +1199,19 @@ class HFLM(TemplateLM):
 
         torch.cuda.synchronize()
         total_time = time.time() - start_time
-        self.collect_statistics(total_time,new_token,idx)
+        self.collect_eagle_statistics(total_time,new_token,idx)
 
         return output_ids
 
+    def collect_eagle_statistics(self, total_time, new_token, idx):
+        self.eagle_totaltoken_list.append(int(new_token))
+        self.eagle_totaltime_list.append(total_time)
+        self.eagle_round_list.append(idx)
 
-    def collect_statistics(self, total_time, new_token, idx):
-        self.totaltoken_list.append(int(new_token))
-        self.totaltime_list.append(total_time)
-        self.round_list.append(idx)
+        mat = sum(self.eagle_totaltoken_list) / sum(self.eagle_round_list)
+        speed = sum(self.eagle_totaltoken_list) / sum(self.eagle_totaltime_list)
 
-        mat = sum(self.totaltoken_list) / sum(self.round_list)
-        speed = sum(self.totaltoken_list) / sum(self.totaltime_list)
-
-        eval_logger.info(f"Speed:{speed:.2f}|MAT:{mat:.2f}")
+        eval_logger.info(f"EAGLE: Speed:{speed:.2f}|MAT:{mat:.2f}")
 
 
 
@@ -1646,25 +1660,16 @@ class HFLM(TemplateLM):
             # encode, pad, and truncate contexts for this batch
             # print(f"Before >>> {contexts=}")  # jz0912
             
-            if self.json_config['dual_tok']:
-                # currently only for HumanEval
-                pattern = "Here is the completed function"
-                user_cont, assis_cont = split_by_seed_marker(pattern, contexts[0])
-                msgs = [{"role": "user", "content": user_cont}]
-                
-                contexts = self.draft_tokenizer.apply_chat_template(
-                    msgs, 
-                    add_generation_prompt=True, 
-                    tokenize=False
-                )
-                contexts = (contexts + assis_cont.strip(),)
-
-                if "DeepSeek" in self.target_model_path:
-                    contexts_new = contexts + assis_cont
-                    contexts_new = contexts_new.replace("<think>", "<think>\n\n</think>\n\nFinal answer:")
-                    contexts = (contexts_new,)
-                else:
-                    contexts = (contexts + assis_cont,)
+            # pattern = "Here is the completed function"
+            # user_cont, assis_cont = split_by_seed_marker(pattern, contexts[0])
+            # msgs = [{"role": "user", "content": user_cont}]
+            
+            # contexts = self.draft_tokenizer.apply_chat_template(
+            #     msgs, 
+            #     add_generation_prompt=True, 
+            #     tokenize=False
+            # )
+            # contexts = (contexts + assis_cont.strip(),)
 
             # print(f"After >>> {contexts=}")  # jz0912
             # print(f"{self.draft_tokenizer.eos_token}")
@@ -1691,16 +1696,10 @@ class HFLM(TemplateLM):
 
             # jz0728
             if self.use_sd:
-                if self.json_config['dual_tok']:
-                    input_context_for_dualtok = (user_cont, assis_cont)
-                else:
-                    input_context_for_dualtok = None
-
                 cont = self._model_generate_sd(
                     context=context_enc,
                     attention_mask=attn_masks,
                     stop=until,
-                    input_context_for_dualtok=input_context_for_dualtok,
                     **kwargs,
                 )
             elif self.use_eagle3 or self.use_eagle2:
