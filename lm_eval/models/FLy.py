@@ -98,9 +98,14 @@ class SPDGenerate:
         # 指标统计控制开关
         self.enable_statistics = spd_args.get("enable_statistics", False)
         
-        # 初始化统计变量
+        # 初始化每个样本的统计变量（会在 reset_counter 中重置）
         self.total_initial_mismatch = 0  # 初始的 mismatch 总数（accepted 为 False 的数量）
         self.total_fly_accepted = 0      # 通过 FLy 算法从 False 变成 True 的数量
+        
+        # 初始化全局统计变量（整个数据集的累计，不会被 reset_counter 重置）
+        self.global_total_initial_mismatch = 0  # 整个数据集的初始 mismatch 总数
+        self.global_total_fly_accepted = 0      # 整个数据集的 FLy 接受总数
+        self.global_sample_count = 0            # 处理的样本总数
 
 
 
@@ -760,11 +765,16 @@ class SPDGenerate:
 
         status_msg = f"Speed:{speed:.2f}|MAT:{mat:.2f}|ngramMAT:{mean_ngram_accept:.2f}|DraftRound:{self.num_draft_round.cpu().item()}|TotalTok:{self.num_emitted_tokens}|Elapsed:{elapsed:.2f}"
         
-        # 如果启用了统计，添加统计信息
+        # 如果启用了统计，添加统计信息并累加到全局统计
         if self.enable_statistics:
             fly_accept_rate = (self.total_fly_accepted / self.total_initial_mismatch * 100) if self.total_initial_mismatch > 0 else 0.0
             total_final_rejected = self.total_initial_mismatch - self.total_fly_accepted
             status_msg += f"|InitialMismatch:{self.total_initial_mismatch}|FLyAccepted:{self.total_fly_accepted}|FinalRejected:{total_final_rejected}|FLyAcceptRate:{fly_accept_rate:.2f}%"
+            
+            # 将当前样本的统计累加到全局统计
+            self.global_total_initial_mismatch += self.total_initial_mismatch
+            self.global_total_fly_accepted += self.total_fly_accepted
+            self.global_sample_count += 1
         
         self.cuslog.info(status_msg)
         
@@ -785,7 +795,7 @@ class SPDGenerate:
         return result
     
     def get_statistics(self):
-        """获取统计指标"""
+        """获取当前样本的统计指标"""
         if not self.enable_statistics:
             return None
         
@@ -799,9 +809,65 @@ class SPDGenerate:
             "fly_accept_rate": fly_accept_rate,
         }
     
+    def get_global_statistics(self):
+        """获取整个数据集的全局统计指标"""
+        if not self.enable_statistics:
+            return None
+        
+        # 计算全局总计
+        global_fly_accept_rate = (self.global_total_fly_accepted / self.global_total_initial_mismatch * 100) if self.global_total_initial_mismatch > 0 else 0.0
+        global_total_final_rejected = self.global_total_initial_mismatch - self.global_total_fly_accepted
+        
+        # 计算平均值（每个样本的平均值）
+        avg_initial_mismatch = self.global_total_initial_mismatch / self.global_sample_count if self.global_sample_count > 0 else 0.0
+        avg_fly_accepted = self.global_total_fly_accepted / self.global_sample_count if self.global_sample_count > 0 else 0.0
+        avg_final_rejected = global_total_final_rejected / self.global_sample_count if self.global_sample_count > 0 else 0.0
+        
+        return {
+            # 总计
+            "global_total_initial_mismatch": self.global_total_initial_mismatch,
+            "global_total_fly_accepted": self.global_total_fly_accepted,
+            "global_total_final_rejected": global_total_final_rejected,
+            "global_fly_accept_rate": global_fly_accept_rate,
+            # 平均值
+            "avg_initial_mismatch": avg_initial_mismatch,
+            "avg_fly_accepted": avg_fly_accepted,
+            "avg_final_rejected": avg_final_rejected,
+            "avg_fly_accept_rate": global_fly_accept_rate,  # 全局接受率就是平均接受率
+            # 样本数
+            "sample_count": self.global_sample_count,
+        }
+    
+    def print_global_statistics(self):
+        """打印整个数据集的全局统计结果"""
+        if not self.enable_statistics:
+            return
+        
+        stats = self.get_global_statistics()
+        if stats is None:
+            return
+        
+        self.cuslog.info("=" * 80)
+        self.cuslog.info("数据集全局统计结果 (Global Statistics)")
+        self.cuslog.info("=" * 80)
+        self.cuslog.info(f"处理的样本总数 (Total Samples): {stats['sample_count']}")
+        self.cuslog.info("")
+        self.cuslog.info("总计 (Totals):")
+        self.cuslog.info(f"  初始 Mismatch 总数: {stats['global_total_initial_mismatch']}")
+        self.cuslog.info(f"  FLy 接受总数: {stats['global_total_fly_accepted']}")
+        self.cuslog.info(f"  最终拒绝总数: {stats['global_total_final_rejected']}")
+        self.cuslog.info(f"  FLy 接受率: {stats['global_fly_accept_rate']:.2f}%")
+        self.cuslog.info("")
+        self.cuslog.info("平均值 (Averages per Sample):")
+        self.cuslog.info(f"  平均初始 Mismatch: {stats['avg_initial_mismatch']:.2f}")
+        self.cuslog.info(f"  平均 FLy 接受: {stats['avg_fly_accepted']:.2f}")
+        self.cuslog.info(f"  平均最终拒绝: {stats['avg_final_rejected']:.2f}")
+        self.cuslog.info(f"  平均 FLy 接受率: {stats['avg_fly_accept_rate']:.2f}%")
+        self.cuslog.info("=" * 80)
+    
     def reset_counter(self):
         self._counter_inited = False
-        # 重置统计变量
+        # 重置当前样本的统计变量（全局统计在 show_status 中累加，这里只重置当前样本的）
         if self.enable_statistics:
             self.total_initial_mismatch = 0
             self.total_fly_accepted = 0

@@ -1782,6 +1782,10 @@ class HFLM(TemplateLM):
         res = re_ords.get_original(res)
 
         pbar.close()
+        
+        # 如果启用了统计，在数据集评估完成后打印全局统计
+        if self.use_sd and hasattr(self, 'spd_gen') and self.spd_gen.enable_statistics:
+            self.spd_gen.print_global_statistics()
 
         return res
 
