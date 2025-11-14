@@ -138,6 +138,10 @@ class VLLM(TemplateLM):
         # End marker for thinking tags - splits to get response after this token (if provided).
         think_end_token: Optional[str] = None,
         max_lora_rank: int = 16,
+        # jz1114 FLy algorithm parameters
+        enable_fly: bool = False,
+        fly_win_len: int = 8,
+        entropy_threshold: Optional[float] = None,
         **kwargs,
     ):
         super().__init__()
@@ -174,6 +178,10 @@ class VLLM(TemplateLM):
             "seed": int(seed),
             "enable_lora": True if lora_local_path else False,
             "max_lora_rank": int(max_lora_rank),
+            # jz1114 FLy algorithm parameters
+            "enable_fly": enable_fly,
+            "fly_win_len": fly_win_len,
+            "entropy_threshold": entropy_threshold,
         }
         self.model_args.update(kwargs)
         self.batch_size = (
