@@ -2,6 +2,7 @@ import copy
 import gc
 import logging
 import os
+import time
 from importlib.metadata import version
 from importlib.util import find_spec
 from multiprocessing import Process, Queue
@@ -142,6 +143,8 @@ class VLLM(TemplateLM):
         enable_fly: bool = False,
         fly_win_len: int = 8,
         entropy_threshold: Optional[float] = None,
+        draft_model=None,
+        spd_k=15,
         **kwargs,
     ):
         super().__init__()
@@ -178,11 +181,19 @@ class VLLM(TemplateLM):
             "seed": int(seed),
             "enable_lora": True if lora_local_path else False,
             "max_lora_rank": int(max_lora_rank),
-            # jz1114 FLy algorithm parameters
-            "enable_fly": enable_fly,
-            "fly_win_len": fly_win_len,
-            "entropy_threshold": entropy_threshold,
+            "speculative_config": None,
         }
+
+        # jz1114 FLy algorithm parameters
+        if draft_model is not None:
+            self.model_args['speculative_config'] = {
+                "model": draft_model,
+                "num_speculative_tokens": spd_k,
+                "enable_fly": enable_fly,
+                "fly_win_len": fly_win_len,
+                "entropy_threshold": entropy_threshold,
+                }
+
         self.model_args.update(kwargs)
         self.batch_size = (
             "auto"
@@ -262,6 +273,11 @@ class VLLM(TemplateLM):
             )
 
         self._max_gen_toks = max_gen_toks
+
+        # 性能统计变量
+        self._total_generated_tokens = 0
+        self._total_generation_time = 0.0
+        self._batch_count = 0
 
         if lora_local_path is not None:
             assert parse_version(version("vllm")) > parse_version("0.3.0"), (
@@ -486,7 +502,7 @@ class VLLM(TemplateLM):
             outputs = self.model.generate(
                 [TokensPrompt(prompt_token_ids=request) for request in requests],
                 sampling_params=sampling_params,
-                use_tqdm=True if self.batch_size == "auto" else False,
+                use_tqdm=True,
                 lora_request=self.lora_request,
             )
             return outputs
@@ -629,6 +645,8 @@ class VLLM(TemplateLM):
                     )
             context_encoding = [x[-max_ctx_len:] for x in context_encoding]
 
+            batch_start_time = time.time()
+
             # perform batched generation
             cont = self._model_generate(
                 requests=context_encoding,
@@ -638,9 +656,23 @@ class VLLM(TemplateLM):
                 **kwargs,
             )
 
+            # 计算当前batch的统计信息
+            batch_end_time = time.time()
+            batch_generation_time = batch_end_time - batch_start_time
+            batch_generated_tokens = 0
+
             # cache generations
             for output, context in zip(cont, context):
                 generated_text: str = output.outputs[0].text
+
+                # 统计生成的token数（使用output中的token信息更准确）
+                if hasattr(output.outputs[0], 'token_ids'):
+                    batch_generated_tokens += len(output.outputs[0].token_ids)
+                else:
+                    # fallback: 使用tokenizer估算
+                    batch_generated_tokens += len(self.tokenizer.encode(generated_text))
+                
+
                 # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
                 generated_text = postprocess_generated_text(
                     generated_text, until, self.think_end_token
@@ -651,7 +683,36 @@ class VLLM(TemplateLM):
                 )
                 pbar.update(1)
 
+            # 更新全局统计
+            self._batch_count += 1
+            self._total_generated_tokens += batch_generated_tokens
+            self._total_generation_time += batch_generation_time
+            
+            # 计算速度
+            current_speed = batch_generated_tokens / batch_generation_time if batch_generation_time > 0 else 0
+            global_speed = self._total_generated_tokens / self._total_generation_time if self._total_generation_time > 0 else 0
+            
+            # 打印速度信息
+            eval_logger.info(
+                f"Batch #{self._batch_count} - Generated {batch_generated_tokens} tokens in {batch_generation_time:.2f}s | "
+                f"Current Speed: {current_speed:.2f} tok/s | "
+                f"Global Speed: {global_speed:.2f} tok/s "
+                f"(Total: {self._total_generated_tokens} tokens in {self._total_generation_time:.2f}s)"
+            )
+
         pbar.close()
+        
+        # 打印最终统计信息
+        if self._total_generation_time > 0:
+            eval_logger.info("=" * 80)
+            eval_logger.info("FINAL GENERATION STATISTICS")
+            eval_logger.info(f"  Total Batches: {self._batch_count}")
+            eval_logger.info(f"  Total Generated Tokens: {self._total_generated_tokens}")
+            eval_logger.info(f"  Total Generation Time: {self._total_generation_time:.2f}s")
+            eval_logger.info(f"  Average Generation Speed: {self._total_generated_tokens / self._total_generation_time:.2f} tok/s")
+            eval_logger.info(f"  Average Tokens per Batch: {self._total_generated_tokens / self._batch_count:.2f}")
+            eval_logger.info("=" * 80)
+
         # reorder all group of results back to original unsorted form
         return re_ords.get_original(res)
 
