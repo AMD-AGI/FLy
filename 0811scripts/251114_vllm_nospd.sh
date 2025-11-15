@@ -22,22 +22,25 @@ fly_win_len=6
 entropy_threshold=0.3  # Set to a float value if needed, e.g., 0.5
 
 # Task to evaluate
-task=humaneval_instruct
+task=gsm8k_cot_llama
 
 # Output directory
-data=251114
+data=251115
 
 # Run evaluation with vLLM
-python -m lm_eval \
-    --model vllm \
-    --model_args pretrained=${target_model},enable_fly=${enable_fly},fly_win_len=${fly_win_len},entropy_threshold=${entropy_threshold},spd_k=15,draft_model=${llama31_8B} \
-    --tasks ${task} \
-    --output_path ./eval_out/${data}_vllm_${task} \
-    --show_config \
-    --log_samples \
-    --batch_size 16 \
-    --apply_chat_template \
-    --fewshot_as_multiturn \
-    --confirm_run_unsafe_code \
-    &> ./output_log/${data}test_${task}_vllm_FLy_bs16_sps.log
-
+for bs in 1
+do
+    python -m lm_eval \
+        --model vllm \
+        --model_args pretrained=${target_model} \
+        --tasks ${task} \
+        --output_path ./eval_out/${data}_vllm_${task} \
+        --show_config \
+        --log_samples \
+        --batch_size $bs \
+        --apply_chat_template \
+        --fewshot_as_multiturn \
+        --confirm_run_unsafe_code \
+        --limit 200 \
+        &> ./output_log/${data}_${task}_vllm_FLy_nospd_bs${bs}_tp1.log
+done

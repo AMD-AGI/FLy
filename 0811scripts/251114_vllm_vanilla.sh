@@ -39,5 +39,5 @@ python -m lm_eval \
     --apply_chat_template \
     --fewshot_as_multiturn \
     --confirm_run_unsafe_code \
-    &> ./output_log/${data}test_${task}_vllm_FLy_bs16_sps.log
+    &> ./output_log/${data}_${task}_vllm_FLy_bs16_sps2.log
 
