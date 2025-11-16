@@ -414,6 +414,11 @@ class HFLM(TemplateLM):
                 "verbose":self.json_config["verbose"],
                 "abla_no_window":self.json_config["abla_no_window"],
                 "enable_statistics":enable_statistics,  # 指标统计开关，从命令行参数传入，默认关闭
+                # Tree verify 相关参数
+                "tree_verify":self.json_config.get("tree_verify", False),
+                "branch_n":self.json_config.get("branch_n", 10),
+                "max_nodes_per_level":self.json_config.get("max_nodes_per_level", 10),
+                "max_nodes_global":self.json_config.get("max_nodes_global", 100),
             }
 
             if self.json_config['dual_tok']:
@@ -745,6 +750,8 @@ class HFLM(TemplateLM):
         # These parameters are handled in __init__ and stored in self.json_config
         custom_params = set(self.json_config.keys()) if hasattr(self, 'json_config') else set()
         custom_params.add('config_path')  # Also filter out config_path
+        # Tree verify 相关参数也不应该传递给模型初始化
+        custom_params.update(['tree_verify', 'branch_n', 'max_nodes_per_level', 'max_nodes_global'])
         for param in custom_params:
             model_kwargs.pop(param, None)  # Remove if exists, ignore if not
 

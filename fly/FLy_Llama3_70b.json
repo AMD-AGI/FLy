@@ -17,6 +17,10 @@
     "num_ngram_pred_tokens": 6,
     "verbose": false,
     "abla_no_window": false,
-    "ea_model_path": null
+    "ea_model_path": null,
+    "tree_verify": true,
+    "branch_n": 10,
+    "max_nodes_per_level": 10,
+    "max_nodes_global": 100
 }
 
