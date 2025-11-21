@@ -752,25 +752,20 @@ class SPDGenerate:
             kv_len = original_kv_len
             total_len = kv_len + num_tokens
             
-            # 4. 构建完整的 4D attention mask: [1, 1, total_len, total_len]
+            # 4. 构建 4D attention mask: [1, 1, num_tokens, total_len]
             # 初始化为 -inf（不能 attend）
             attention_mask = torch.full(
-                (1, 1, total_len, total_len),
+                (1, 1, num_tokens, total_len),
                 float('-inf'),
                 device=device,
                 dtype=torch.float32
             )
             
-            # 4.1. KV cache 部分：标准 causal mask
-            for i in range(kv_len):
-                for j in range(i + 1):
-                    attention_mask[0, 0, i, j] = 0.0
-            
-            # 4.2. Tree tokens 部分
+            # 4.1. Tree tokens 之间的 mask 构建
             # 为 selected_list 中的每个节点建立索引映射
             node_to_position = {node_idx: pos for pos, node_idx in enumerate(selected_list)}
             
-            # 首先构建 tree tokens 之间的 mask
+            # 首先构建 tree tokens 之间的 mask [num_tokens, num_tokens]
             tree_mask = torch.zeros((num_tokens, num_tokens), device=device, dtype=torch.float32)
             
             # 从前往后迭代，利用父节点的 mask
@@ -786,16 +781,15 @@ class SPDGenerate:
                     tree_mask[i, :] = tree_mask[parent_pos, :]
                     tree_mask[i, i] = 1.0
             
-            # 将 tree_mask 应用到完整的 attention_mask
-            for i in range(num_tokens):
-                # Tree token 可以看到所有 KV cache 中的 tokens
-                for j in range(kv_len):
-                    attention_mask[0, 0, kv_len + i, j] = 0.0
-                
-                # Tree token 之间根据 tree_mask 决定
-                for j in range(num_tokens):
-                    if tree_mask[i, j] > 0:
-                        attention_mask[0, 0, kv_len + i, kv_len + j] = 0.0
+            # 4.2. 填充 attention_mask
+            # 所有 Tree tokens 都可以看到完整的 KV cache
+            attention_mask[:, :, :, :kv_len] = 0.0
+            
+            # Tree tokens 之间的可见性由 tree_mask 决定
+            # tree_mask: [num_tokens, num_tokens] -> 1.0 表示可见
+            # 我们需要将 1.0 映射为 0.0, 0.0 映射为 -inf
+            mask_val = torch.where(tree_mask > 0, 0.0, float('-inf'))
+            attention_mask[:, :, :, kv_len:] = mask_val.unsqueeze(0).unsqueeze(0)
             
             # 5. 创建 position_ids
             position_ids = torch.arange(kv_len, kv_len + num_tokens, device=device, dtype=torch.long).unsqueeze(0)
@@ -1250,36 +1244,33 @@ class SPDGenerate:
                 current_len = 1 + num_tokens
                 total_len = past_kv_len + current_len
                 
-                # 构建完整的 4D attention mask: [1, 1, total_len, total_len]
+                # 构建完整的 4D attention mask: [1, 1, current_len, total_len]
+                # current_len = 1 + num_tokens (seed + tree tokens)
+                # total_len = past_kv_len + current_len
                 full_attention_mask = torch.full(
-                    (1, 1, total_len, total_len),
+                    (1, 1, current_len, total_len),
                     float('-inf'),
                     device=device,
                     dtype=torch.float32
                 )
                 
-                # KV cache 部分：标准 causal mask
-                for i in range(past_kv_len):
-                    for j in range(i + 1):
-                        full_attention_mask[0, 0, i, j] = 0.0
+                # 1. Seed token (index 0 in current_len, index past_kv_len in total_len)
+                # 可以看到所有 KV cache
+                full_attention_mask[:, :, 0, :past_kv_len] = 0.0
+                # 可以看到自己
+                full_attention_mask[:, :, 0, past_kv_len] = 0.0
                 
-                # Seed token：可以看到所有 KV cache 和自己
-                for j in range(past_kv_len + 1):
-                    full_attention_mask[0, 0, past_kv_len, j] = 0.0
+                # 2. Tree tokens (indices 1..num_tokens in current_len)
+                # 可以看到所有 KV cache
+                full_attention_mask[:, :, 1:, :past_kv_len] = 0.0
+                # 可以看到 Seed token
+                full_attention_mask[:, :, 1:, past_kv_len] = 0.0
                 
-                # Tree tokens 部分
-                for i in range(num_tokens):
-                    # Tree token 可以看到所有 KV cache
-                    for j in range(past_kv_len):
-                        full_attention_mask[0, 0, past_kv_len + 1 + i, j] = 0.0
-                    
-                    # Tree token 可以看到 seed token
-                    full_attention_mask[0, 0, past_kv_len + 1 + i, past_kv_len] = 0.0
-                    
-                    # Tree token 之间根据 tree_mask 决定
-                    for j in range(num_tokens):
-                        if tree_mask[0, 0, i, j] > 0:
-                            full_attention_mask[0, 0, past_kv_len + 1 + i, past_kv_len + 1 + j] = 0.0
+                # Tree tokens 之间的可见性
+                # tree_mask: [1, 1, num_tokens, num_tokens] -> 1.0 表示可见
+                # 需要将 1.0 映射为 0.0, 0.0 映射为 -inf
+                tree_mask_val = torch.where(tree_mask > 0, 0.0, float('-inf'))
+                full_attention_mask[:, :, 1:, past_kv_len + 1:] = tree_mask_val
                 
                 # 创建 position_ids
                 position_ids = torch.arange(past_kv_len, past_kv_len + current_len, device=device, dtype=torch.long).unsqueeze(0)
