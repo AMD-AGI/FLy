@@ -102,14 +102,11 @@ class SPDGenerate:
         # 指标统计控制开关
         self.enable_statistics = spd_args.get("enable_statistics", False)
         
-        # Tree verify 相关参数：仅从环境变量中取值
-        tree_verify_val = os.environ.get('TREE_VERIFY')
-        self.tree_verify = bool(int(tree_verify_val))
-        branch_n_val = os.environ.get('TREE_BRANCH_N')
-        self.branch_n = int(branch_n_val)  # 每个节点拓展的 top-n
-        max_nodes_per_level_val = os.environ.get('TREE_MAX_NODES_PER_LEVEL')
-        self.max_nodes_per_level = int(max_nodes_per_level_val)  # 每层最多保留的节点数
-        self.max_nodes_global = int(os.environ.get('TREE_MAX_NODES_GLOBAL'))  # 全局最多保留的节点数
+        # Tree verify 相关参数
+        self.tree_verify = spd_args.get("tree_verify", False)
+        self.branch_n = spd_args.get("branch_n", 10)  # 每个节点拓展的 top-n
+        self.max_nodes_per_level = spd_args.get("max_nodes_per_level", 10)  # 每层最多保留的节点数
+        self.max_nodes_global = spd_args.get("max_nodes_global", 100)  # 全局最多保留的节点数
         
         # 当启用 tree_verify 时，禁用 ngram（不兼容）
         if self.tree_verify:
