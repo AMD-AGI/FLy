@@ -1,5 +1,7 @@
 output_log
 eval_out
+Ref
+*md
 
 # macOS system files
 .DS_Store

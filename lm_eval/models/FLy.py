@@ -1,8 +1,9 @@
 import torch
 import time
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Dict, List, Tuple
 from functools import cached_property
+import os
 
 
 
@@ -101,28 +102,14 @@ class SPDGenerate:
         # 指标统计控制开关
         self.enable_statistics = spd_args.get("enable_statistics", False)
         
-        # Tree verify 相关参数
-        self.tree_verify = spd_args.get("tree_verify", False)
-        self.branch_n = spd_args.get("branch_n", 10)  # 每个节点拓展的 top-n
-        self.max_nodes_per_level = spd_args.get("max_nodes_per_level", 100)  # 每层最多保留的节点数
-        self.max_nodes_global = spd_args.get("max_nodes_global", None)  # 全局最多保留的节点数（None 表示不限制）
-        
-        # 在 tree_verify 模式下，限制 k 的最大值避免树过大
-        if self.tree_verify:
-            max_k_for_tree = 5  # 限制树的最大深度为 5
-            if self.k > max_k_for_tree:
-                self.cuslog.warning(f"[Tree Verify] k={self.k} is too large for tree mode, limiting to {max_k_for_tree}")
-                self.k = max_k_for_tree
-            
-            # 设置合理的默认值
-            if self.max_nodes_per_level > 50:
-                self.max_nodes_per_level = 50  # 限制每层最多 50 个节点
-            if self.max_nodes_global is None:
-                self.max_nodes_global = 200  # 限制全局最多 200 个节点
-            
-            # 在 tree_verify 模式下强制启用 verbose 以便调试
-            self.verbose = False
-            self.cuslog.info(f"[Tree Verify] Enabled with k={self.k}, branch_n={self.branch_n}, max_nodes_per_level={self.max_nodes_per_level}, max_nodes_global={self.max_nodes_global}")
+        # Tree verify 相关参数：仅从环境变量中取值
+        tree_verify_val = os.environ.get('TREE_VERIFY')
+        self.tree_verify = bool(int(tree_verify_val))
+        branch_n_val = os.environ.get('TREE_BRANCH_N')
+        self.branch_n = int(branch_n_val)  # 每个节点拓展的 top-n
+        max_nodes_per_level_val = os.environ.get('TREE_MAX_NODES_PER_LEVEL')
+        self.max_nodes_per_level = int(max_nodes_per_level_val)  # 每层最多保留的节点数
+        self.max_nodes_global = int(os.environ.get('TREE_MAX_NODES_GLOBAL'))  # 全局最多保留的节点数
         
         # 当启用 tree_verify 时，禁用 ngram（不兼容）
         if self.tree_verify:
@@ -348,7 +335,7 @@ class SPDGenerate:
             accepted: torch.Tensor,  # [batch_size, k]
             substitute_token_ids: torch.Tensor,  # [batch_size, k]
             draft_token_ids: torch.Tensor,  # [batch_size, k]
-            bonus_token_ids: torch.Tensor,  # [batch_size] or [batch_size, 1]
+            bonus_token_ids: torch.Tensor = None,  # [batch_size] or [batch_size, 1] or None
             update_counter=False,
     ) -> torch.Tensor:
         """Format output. Returns a matrix of token ids. When
@@ -359,13 +346,13 @@ class SPDGenerate:
             accepted: [batch_size, k] - bool tensor，表示是否接受每个草稿 token
             substitute_token_ids: [batch_size, k] - 拒绝时使用的替代 tokens
             draft_token_ids: [batch_size, k] - 草稿模型生成的 tokens
-            bonus_token_ids: [batch_size] or [batch_size, 1] - bonus token
+            bonus_token_ids: [batch_size] or [batch_size, 1] or None - bonus token（可选）
 
         输出形状:
             output: [batch_size, valid_len] - 接受的 tokens（-1 表示无效）
         """
         batch_size, k = substitute_token_ids.shape
-        bonus_token_ids = bonus_token_ids.squeeze(-1)  # 确保形状为 [batch_size]
+        
         # Determine the index of the first False value for each row.
         limits = (accepted == 0).max(1).indices
         limits[~(accepted == 0).any(1)] = k
@@ -387,11 +374,16 @@ class SPDGenerate:
         output[:, :k] = torch.where(accepted_mask, draft_token_ids,
                                     -torch.ones_like(draft_token_ids))
 
-        # Fill the last column.
+        # Fill the last column (bonus token).
         # We check output directly as accepted may have True values inconsistent
         # with causal acceptance.
-        output_with_bonus_tokens[:, -1] = torch.where(output[:, -1] != -1,
-                                                      bonus_token_ids, -1)
+        if bonus_token_ids is not None:
+            bonus_token_ids = bonus_token_ids.squeeze(-1)  # 确保形状为 [batch_size]
+            output_with_bonus_tokens[:, -1] = torch.where(output[:, -1] != -1,
+                                                          bonus_token_ids, -1)
+        else:
+            # 没有 bonus token，最后一列保持为 -1
+            output_with_bonus_tokens[:, -1] = -1
 
         # Fill the recovered token ids.
         output.mul_(~after_false_mask).add_(
@@ -650,359 +642,493 @@ class SPDGenerate:
         self.position_ids = torch.zeros(self.branch_n, device=device, dtype=torch.long)
 
     @torch.no_grad()
-    def draft_with_tree(self, seed_token, past_kv_draft, temp=0):
+    def draft_with_tree(self, seed_token, past_kv_draft, temp=0, accepted_tokens=None):
         """
-        树形草稿生成：采用类似 cnets.py 的高效批量处理方式
+        树形草稿生成：逐层生成并剪枝的优化实现
         
-        关键：复用原始上下文的 KV cache（past_kv_draft），批量处理节点，
-        使用 tree_mask 机制管理注意力。
+        特点：
+        1. 逐层生成，每层保留 max_nodes_per_level 个最高分节点
+        2. 使用累积 log 概率作为 score
+        3. 每个节点生成时输入完整路径（从 root 到当前节点）
+        4. KV cache 管理：第一步时可以同时更新上一轮接受的 tokens
         
         Args:
-            seed_token: [1, 1] 当前上下文的最后一个 token
+            seed_token: [1, 1] or [1, n] 当前上下文的最后 token(s)
             past_kv_draft: draft model 的 past_key_values（原始上下文的 KV cache）
-            temp: 温度参数
+            temp: 温度参数（默认0，greedy）
+            accepted_tokens: [1, m] 上一轮接受的 tokens（可选，用于更新 KV cache）
         
         Returns:
             tree_data: dict containing:
                 - flat_tokens: torch.Tensor[T], 所有节点的 token_id
-                - parent_indices: torch.Tensor[T], 每个节点的父节点索引
-                - tree_mask: torch.Tensor[T, T], 树形注意力掩码
-                - retrieve_indices: torch.Tensor[num_paths, max_depth], 从根到叶子的路径
-                - tree_position_ids: torch.Tensor[T], 每个节点的位置ID
+                - parent_indices: List[int], 每个节点的父节点索引
+                - scores: torch.Tensor[T], 每个节点的累积得分
+                - depths: List[int], 每个节点的深度
+                - paths: List[List[int]], 从根到叶子的所有路径
+                - updated_kv: 更新后的 KV cache（如果提供了 accepted_tokens）
+        
+        重要说明：
+            - 如果提供了 accepted_tokens，会在第一步时一并输入以更新 KV cache
+            - 这样可以避免在 tree verify 后再单独更新 KV cache
         """
         device = seed_token.device
         
         if self.verbose:
-            self.cuslog.info(f"[draft_with_tree] Starting with device={device}, k={self.k}, branch_n={self.branch_n}")
+            self.cuslog.info(f"[draft_with_tree] Starting tree generation: k={self.k}, branch_n={self.branch_n}, max_nodes_per_level={self.max_nodes_per_level}")
         
-        # 初始化树形掩码
-        self.init_tree_mask(device)
+        # 使用列表结构维护节点信息（未剪枝）
+        score_list = []  # 所有节点的 score
+        token_id_list = []  # 所有节点的 token_id
+        parent_idx_list = []  # 所有节点的父节点索引（-1 表示根节点）
         
-        # 保存原始 KV cache 的长度
-        original_kv_len = past_kv_draft.get_seq_length() if past_kv_draft is not None else 0
-        len_posi = original_kv_len
+        # 剪枝后选择的节点索引
+        selected_list = []  # 记录裁剪后选择的节点索引
+        depth_list = []  # 记录 selected_list 中每个节点对应的深度（从1开始，与 depth 保持一致）
         
-        # 限制总节点数
-        total_nodes = min(self.k * self.branch_n, self.max_nodes_global or 200)
-        depth = self.k
-        top_k = self.branch_n
+        # 第一步：生成第一层节点（depth=1）
+        # 如果提供了 accepted_tokens，一并输入以更新 KV cache
+        if accepted_tokens is not None and accepted_tokens.numel() > 0:
+            # 输入 accepted_tokens + seed_token 以同时更新 KV cache
+            first_input = torch.cat([accepted_tokens, seed_token], dim=1)  # [1, m+1]
+        else:
+            first_input = seed_token  # [1, 1]
         
-        scores_list = []
-        parents_list = []
-        ss_token = []
-        
-        # 第一层：从 seed_token 生成 top-k 个候选
-        out_hidden = self.draft_model(
-            input_ids=seed_token,  # [1, 1]
+        out = self.draft_model(
+            input_ids=first_input,  # [1, 1] or [1, m+1]
             past_key_values=past_kv_draft,
             use_cache=True,
             return_dict=True,
         )
-        past_key_values = out_hidden.past_key_values
+        past_kv_draft = out.past_key_values  # 更新 KV cache（现在包含了 accepted_tokens 和 seed_token）
+        updated_kv = past_kv_draft  # 保存更新后的 KV cache
+        
+        # 保存当前 KV cache 的长度（包含 accepted_tokens 和 seed_token）
+        # tree tokens 不会被加入 KV cache，每次 forward 后都会恢复到这个长度
+        original_kv_len = past_kv_draft.get_seq_length() if past_kv_draft is not None else 0
         
         # 获取 logits 并计算 log probabilities
-        last_hidden = out_hidden.logits[:, -1]  # [1, vocab_size]
+        logits = out.logits[:, -1, :]  # [1, vocab_size]
         if temp > 0:
-            last_hidden = last_hidden / temp
-        last_p = F.log_softmax(last_hidden, dim=-1)  # [1, vocab_size]
+            logits = logits / temp
+        log_probs = F.log_softmax(logits, dim=-1)  # [1, vocab_size]
         
-        # 获取 top-k
-        top = torch.topk(last_p, top_k, dim=-1)
-        topk_index, topk_p = top.indices, top.values  # [1, top_k]
-        scores = topk_p[0]  # [top_k]
+        # 获取 top-k 候选
+        top_k_values, top_k_indices = torch.topk(log_probs[0], self.branch_n)
         
-        scores_list.append(scores[None])  # [1, top_k]
-        parents_list.append(torch.zeros(1, dtype=torch.long, device=device))
-        ss_token.append(topk_index[0])  # [top_k]
+        # 创建第一层节点
+        first_layer_indices = []
+        for i in range(len(top_k_indices)):
+            node_idx = len(score_list)  # 新节点的索引
+            token_id_list.append(top_k_indices[i].item())
+            score_list.append(top_k_values[i].item())  # 第一层的 score 就是 log_prob
+            parent_idx_list.append(-1)  # 根节点没有父节点
+            first_layer_indices.append(node_idx)
         
-        input_ids = topk_index  # [1, top_k]
-        input_hidden = out_hidden.hidden_states[-1][:, -1:, :] if hasattr(out_hidden, 'hidden_states') and out_hidden.hidden_states is not None else None
+        # 剪枝第一层（如果需要）
+        if len(first_layer_indices) > self.max_nodes_per_level:
+            # 按 score 排序，保留前 max_nodes_per_level 个
+            first_layer_indices.sort(key=lambda idx: score_list[idx], reverse=True)
+            first_layer_indices = first_layer_indices[:self.max_nodes_per_level]
         
-        # 如果没有 hidden_states，使用 embedding
-        if input_hidden is None:
-            # 获取 input embedding
-            if hasattr(self.draft_model.model, 'embed_tokens'):
-                input_embeds = self.draft_model.model.embed_tokens(topk_index)  # [1, top_k, hidden_size]
-            else:
-                # 如果模型结构不同，尝试其他方式
-                input_embeds = self.draft_model.get_input_embeddings()(topk_index)  # [1, top_k, hidden_size]
-            input_hidden = input_embeds.transpose(0, 1)  # [top_k, 1, hidden_size]
-        else:
-            input_hidden = input_hidden.repeat(top_k, 1, 1)  # [top_k, 1, hidden_size]
+        # 将第一层选中的节点加入 selected_list，同时记录深度
+        prev_selected_len = len(selected_list)  # extend 前的长度（应该是0）
+        selected_list.extend(first_layer_indices)
+        depth_list.extend([1] * len(first_layer_indices))  # 第一层的 depth=1
         
-        tree_mask = self.tree_mask_init
-        topk_cs_index = torch.arange(top_k, device=device)
+        if self.verbose:
+            self.cuslog.info(f"[draft_with_tree] Layer 1: generated {len(first_layer_indices)} nodes")
         
-        # 逐层扩展树（类似 cnets.py 的方式）
-        for i in range(depth - 1):
-            # 设置 tree_mask 用于注意力
-            self.tree_mask = tree_mask
-            position_ids = (len_posi + self.position_ids).unsqueeze(0)  # [1, top_k]
+        # 逐层扩展树（depth = 2 到 k）
+        for depth in range(2, self.k + 1):
+            # 获取当前层的节点索引：使用上一层的节点（通过 prev_selected_len 获取）
+            current_layer_indices = selected_list[prev_selected_len:]
             
-            # 批量处理当前层的所有节点
-            # 注意：这里使用批量输入，而不是逐个处理
-            out_hidden = self.draft_model(
-                input_ids=input_ids,  # [1, top_k]
-                past_key_values=past_key_values,
-                position_ids=position_ids,  # [1, top_k]
+            # 将整个 selected_list 的所有 tokens 传入模型
+            # 1. 收集 selected_list 中所有节点的 tokens
+            all_tree_tokens = [token_id_list[idx] for idx in selected_list]
+            
+            # 2. 将 tokens 转换为 tensor
+            num_tokens = len(selected_list)
+            input_ids = torch.tensor(all_tree_tokens, device=device, dtype=torch.long).unsqueeze(0)  # [1, num_tokens]
+            
+            # 3. 获取 KV cache 长度
+            kv_len = original_kv_len
+            total_len = kv_len + num_tokens
+            
+            # 4. 构建完整的 4D attention mask: [1, 1, total_len, total_len]
+            # 初始化为 -inf（不能 attend）
+            attention_mask = torch.full(
+                (1, 1, total_len, total_len),
+                float('-inf'),
+                device=device,
+                dtype=torch.float32
+            )
+            
+            # 4.1. KV cache 部分：标准 causal mask
+            for i in range(kv_len):
+                for j in range(i + 1):
+                    attention_mask[0, 0, i, j] = 0.0
+            
+            # 4.2. Tree tokens 部分
+            # 为 selected_list 中的每个节点建立索引映射
+            node_to_position = {node_idx: pos for pos, node_idx in enumerate(selected_list)}
+            
+            # 首先构建 tree tokens 之间的 mask
+            tree_mask = torch.zeros((num_tokens, num_tokens), device=device, dtype=torch.float32)
+            
+            # 从前往后迭代，利用父节点的 mask
+            for i, node_idx in enumerate(selected_list):
+                parent_node_idx = parent_idx_list[node_idx]
+                
+                if parent_node_idx == -1:
+                    # 根节点：只能看到自己
+                    tree_mask[i, i] = 1.0
+                else:
+                    # 子节点：继承父节点的 mask + 自己
+                    parent_pos = node_to_position[parent_node_idx]
+                    tree_mask[i, :] = tree_mask[parent_pos, :]
+                    tree_mask[i, i] = 1.0
+            
+            # 将 tree_mask 应用到完整的 attention_mask
+            for i in range(num_tokens):
+                # Tree token 可以看到所有 KV cache 中的 tokens
+                for j in range(kv_len):
+                    attention_mask[0, 0, kv_len + i, j] = 0.0
+                
+                # Tree token 之间根据 tree_mask 决定
+                for j in range(num_tokens):
+                    if tree_mask[i, j] > 0:
+                        attention_mask[0, 0, kv_len + i, kv_len + j] = 0.0
+            
+            # 5. 创建 position_ids
+            position_ids = torch.arange(kv_len, kv_len + num_tokens, device=device, dtype=torch.long).unsqueeze(0)
+            
+            # 6. Forward 通过 draft model（直接传入 4D attention mask）
+            out = self.draft_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_kv_draft,
                 use_cache=True,
                 return_dict=True,
-                # 如果模型支持 attention_mask，可以传入
             )
-            past_key_values = out_hidden.past_key_values
-            len_posi += 1
             
-            # 计算偏移量（用于 parent 索引）
-            bias1 = top_k if i > 0 else 0
-            bias2 = max(0, i - 1)
-            bias = 1 + top_k ** 2 * bias2 + bias1
-            parents = (topk_cs_index + bias)
-            parents_list.append(parents)
+            # 7. 提取 current_layer_indices 对应的 logits（它们在 selected_list 中的位置）
+            all_logits = []
+            for parent_idx in current_layer_indices:
+                pos_in_selected = node_to_position[parent_idx]
+                all_logits.append(out.logits[:, pos_in_selected:pos_in_selected+1, :])  # [1, 1, vocab_size]
             
-            # 获取 logits 并计算概率
-            last_hidden = out_hidden.logits[:, -top_k:]  # [1, top_k, vocab_size]
+            # 8. 恢复 KV cache 到原始长度（tree tokens 不应该被加入 KV cache）
+            past_kv_draft = out.past_key_values
+            past_kv_draft.crop(original_kv_len)
+            
+            # 批量处理所有节点的 logits
+            all_logits = torch.cat(all_logits, dim=0)  # [num_nodes, vocab_size]
             if temp > 0:
-                last_hidden = last_hidden / temp
-            last_p = F.log_softmax(last_hidden, dim=-1)  # [1, top_k, vocab_size]
+                all_logits = all_logits / temp
+            log_probs = F.log_softmax(all_logits, dim=-1)  # [num_nodes, vocab_size]
             
-            # 对每个节点获取 top-k 候选
-            top = torch.topk(last_p, top_k, dim=-1)
-            topk_index, topk_p = top.indices, top.values  # [1, top_k, top_k]
+            # 对每个父节点生成子节点
+            next_layer_indices = []
+            for i, parent_idx in enumerate(current_layer_indices):
+                parent_score = score_list[parent_idx]
+                
+                # 获取该父节点的 top-k 候选
+                node_log_probs = log_probs[i]  # [vocab_size]
+                top_k_values, top_k_indices = torch.topk(node_log_probs, min(self.branch_n, node_log_probs.shape[-1]))
+                
+                # 创建子节点
+                for j in range(len(top_k_indices)):
+                    node_idx = len(score_list)  # 新节点的索引
+                    token_id_list.append(top_k_indices[j].item())
+                    score_list.append(parent_score + top_k_values[j].item())  # 累积 score
+                    parent_idx_list.append(parent_idx)
+                    next_layer_indices.append(node_idx)
             
-            # 计算累积得分
-            cu_scores = topk_p[0] + scores[:, None]  # [top_k, top_k]
+            # 当前层剪枝：保留 score 最高的 max_nodes_per_level 个节点
+            if len(next_layer_indices) > self.max_nodes_per_level:
+                next_layer_indices.sort(key=lambda idx: score_list[idx], reverse=True)
+                next_layer_indices = next_layer_indices[:self.max_nodes_per_level]
             
-            # 选择得分最高的 top_k 个节点
-            topk_cs = torch.topk(cu_scores.view(-1), min(top_k, cu_scores.numel()), dim=-1)
-            topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
-            scores = topk_cs_p  # 更新得分
+            # 将当前层选中的节点加入 selected_list，同时记录深度
+            prev_selected_len = len(selected_list)  # 记录 extend 前的长度（即上一层的结束位置）
+            selected_list.extend(next_layer_indices)
+            depth_list.extend([depth] * len(next_layer_indices))  # 当前层的 depth（用于全局剪枝后）
             
-            # 确定选中节点的父节点
-            out_ids = topk_cs_index // top_k
+            if self.verbose:
+                self.cuslog.info(f"[draft_with_tree] Layer {depth}: generated {len(next_layer_indices)} nodes")
             
-            # 获取选中的 token ids
-            input_ids = topk_index.view(-1)[topk_cs_index][None]  # [1, top_k]
+           
+        
+        # 恢复 past_kv_draft 到原始长度
+        if past_kv_draft is not None:
+            past_kv_draft.crop(original_kv_len)
+        
+        # 全局节点数限制（在 tree 构建完成后进行剪枝）
+        if self.max_nodes_global and len(selected_list) > self.max_nodes_global:
+            # 保留 score 最高的节点，同时保持 selected_list 和 depth_list 的对应关系
+            node_scores = [(idx, score_list[idx], depth_list[i]) for i, idx in enumerate(selected_list)]
+            node_scores.sort(key=lambda x: x[1], reverse=True)
+            kept_nodes = node_scores[:self.max_nodes_global]
+            selected_list = [x[0] for x in kept_nodes]
+            depth_list = [x[2] for x in kept_nodes]  # 同时剪枝 depth_list
             
-            ss_token.append(input_ids[0])
-            scores_list.append(cu_scores)
+            if self.verbose:
+                self.cuslog.info(f"[draft_with_tree] Global pruning: kept {len(selected_list)} nodes")
+        
+        if self.verbose:
+            self.cuslog.info(f"[draft_with_tree] Tree generation completed: {len(selected_list)} selected nodes")
+        
+        # 1. 按照 depth_list 层数由浅到深排序 selected_list 和 depth_list
+        # 创建 (depth, selected_idx, list_position) 的元组列表
+        depth_sorted_data = [(depth_list[i], selected_list[i], i) for i in range(len(selected_list))]
+        # 按 depth 排序（从小到大，即从浅到深）
+        depth_sorted_data.sort(key=lambda x: x[0])
+        
+        # 提取排序后的 selected_list 和 depth_list
+        sorted_selected_list = [x[1] for x in depth_sorted_data]
+        sorted_depth_list = [x[0] for x in depth_sorted_data]
+        
+        
+        # 2. 构建 attention_mask (tree_mask)
+        # 为排序后的 selected_list 中的每个节点建立索引映射
+        num_tokens = len(sorted_selected_list)
+        node_to_position = {node_idx: pos for pos, node_idx in enumerate(sorted_selected_list)}
+        
+        # 构建 tree_mask：每个 token 可以看到它的所有 ancestors
+        tree_mask = torch.zeros((num_tokens, num_tokens), device=device, dtype=torch.float32)
+        
+        # 从前往后迭代，利用父节点的 mask（父节点一定在子节点前面，因为按深度排序了）
+        for i, node_idx in enumerate(sorted_selected_list):
+            # 获取父节点
+            parent_node_idx = parent_idx_list[node_idx]
             
-            # 更新 tree_mask
-            if hasattr(out_hidden, 'hidden_states') and out_hidden.hidden_states is not None:
-                input_hidden = out_hidden.hidden_states[-1][:, out_ids]
-            tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
+            if parent_node_idx == -1:
+                # 根节点：只能看到自己
+                tree_mask[i, i] = 1.0
+            else:
+                # 子节点：继承父节点的 mask（父节点能看到的，子节点也能看到）
+                if parent_node_idx in node_to_position:
+                    parent_pos = node_to_position[parent_node_idx]
+                    tree_mask[i, :] = tree_mask[parent_pos, :]
+                # 再加上自己
+                tree_mask[i, i] = 1.0
         
-        # 整理最终的树结构（类似 cnets.py）
-        scores_list = torch.cat(scores_list, dim=0).view(-1)
-        ss_token_list = torch.cat(ss_token, dim=0).view(-1)
-        
-        # 选择得分最高的 total_nodes 个节点
-        top_scores = torch.topk(scores_list, min(total_nodes, scores_list.numel()), dim=-1)
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        
-        # 获取最终的 draft tokens
-        draft_tokens = ss_token_list[top_scores_index]
-        
-        # 构建 parent indices
-        draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
-        mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
-        mask_index[draft_parents == 0] = -1
-        mask_index = mask_index + 1
-        mask_index_list = mask_index.tolist()
-        
-        # 构建 tree mask
-        tree_mask = torch.eye(total_nodes, device=device).bool()
-        tree_mask[:, 0] = True
-        for i in range(total_nodes - 1):
-            if i < len(mask_index_list):
-                tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
-        
-        # 计算 tree position ids
-        tree_position_ids = torch.sum(tree_mask, dim=1) - 1
-        
-        # 转换为 float 并添加维度
-        tree_mask = tree_mask.float()[None, None]
-        
-        # 构建 retrieve indices（从根到叶子的路径）
-        max_depth = torch.max(tree_position_ids) + 1
-        noleaf_index = torch.unique(mask_index).tolist()
-        noleaf_num = len(noleaf_index) - 1 if noleaf_index else 0
-        leaf_num = min(total_nodes - noleaf_num, total_nodes)
-        
-        retrieve_indices = torch.zeros(leaf_num, max_depth.item(), dtype=torch.long, device=device) - 1
-        retrieve_indices_list = retrieve_indices.tolist()
-        
-        rid = 0
-        position_ids_list = tree_position_ids.tolist()
-        
-        for i in range(min(total_nodes, len(position_ids_list))):
-            if i not in noleaf_index:
-                cid = i
-                depth = position_ids_list[i]
-                for j in reversed(range(depth + 1)):
-                    if rid < leaf_num and j < max_depth.item():
-                        retrieve_indices_list[rid][j] = cid
-                    if cid > 0 and cid - 1 < len(mask_index_list):
-                        cid = mask_index_list[cid - 1]
-                    else:
-                        break
-                rid += 1
-                if rid >= leaf_num:
-                    break
-        
-        retrieve_indices = torch.tensor(retrieve_indices_list, dtype=torch.long, device=device)
-        
-        # 裁剪 KV cache 回到原始长度
-        if past_key_values is not None:
-            past_key_values.crop(original_kv_len)
-        
+        # 添加 batch 和 head 维度，变成 [1, 1, num_tokens, num_tokens]
+        attention_mask = tree_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, num_tokens, num_tokens]
+
         return {
-            'flat_tokens': draft_tokens,
-            'parent_indices': mask_index,
-            'tree_mask': tree_mask,
-            'retrieve_indices': retrieve_indices,
-            'tree_position_ids': tree_position_ids,
+            'score_list': score_list,
+            'parent_idx_list': parent_idx_list,
+            'token_id_list': token_id_list,
+            'depth_list': sorted_depth_list,
+            'selected_list': sorted_selected_list,
+            'attention_mask': attention_mask,  # [1, 1, num_tokens, num_tokens]
+            'updated_kv': updated_kv if accepted_tokens is not None else None  # 返回更新后的 KV cache
         }
     
-    def build_tree_attention_mask(self, parent_index, device):
+    def build_tree_attention_mask(self, parent_indices, device):
         """
         构造 tree attention mask
         
         Args:
-            parent_index: List[int], 每个节点的父节点索引
+            parent_indices: List[int], 每个节点的父节点索引（-1 表示根节点）
             device: torch.device
         
         Returns:
-            mask: [T, T] bool tensor, True 表示允许 attention，False 表示 mask
+            mask: [1, 1, T, T] float tensor，0.0 表示允许 attention，-inf 表示 mask
         """
-        T = len(parent_index)
-        mask = torch.zeros((T, T), dtype=torch.bool, device=device)
+        T = len(parent_indices)
+        mask = torch.full((T, T), float('-inf'), device=device)
         
         for i in range(T):
+            # 节点 i 可以看到自己及其所有祖先
             j = i
             while j != -1:
-                mask[i, j] = True
-                j = parent_index[j]
+                mask[i, j] = 0.0
+                if j < len(parent_indices):
+                    j = parent_indices[j]
+                else:
+                    break
+        
+        # 添加 batch 和 head 维度
+        mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
         
         return mask
     
     def verify_tree_paths(
         self,
         tree_data: dict,
-        target_logits_flat: torch.Tensor,  # [T, vocab_size]
+        target_logits: torch.Tensor,  # [1, T+1, vocab_size] 包含 seed logit
         temperature: float,
     ):
         """
-        在每条路径上执行 SPD+FLy 验证，选择最佳路径
+        验证所有树路径，包含 FLy 算法逻辑
         
         Args:
-            tree_data: draft_with_tree 返回的树数据
-                - flat_tokens: torch.Tensor[T], 所有节点的 tokens
-                - retrieve_indices: torch.Tensor[num_paths, max_depth], 路径索引
-            target_logits_flat: [T, vocab_size] target model 对所有节点的 logits
-            temperature: 温度参数
-        
-        Returns:
-            best_path_tokens: [1, k_path] 最佳路径的 draft tokens
-            best_path_accepted: [1, k_path] 最佳路径的 accepted mask（应用 FLy 后）
-            best_path_accepted_before_fly: [1, k_path] 最佳路径的 accepted mask（应用 FLy 前）
-            best_path_recovered: [1, k_path] 最佳路径的 recovered tokens  
-            bonus_logits: [1, 1, vocab_size] 最后一个位置的 logits（用于 bonus token）
+            tree_data: draft_with_tree 的返回值
+            target_logits: [1, T+1, vocab_size] target model 的完整 logits (包含 seed 的输出)
+            temperature: 采样温度
         """
-        flat_tokens = tree_data['flat_tokens']
-        retrieve_indices = tree_data['retrieve_indices']
+        # 移除 batch 维度，变为 [T+1, vocab_size]
+        # 索引 0 对应 seed 的输出 (验证 Layer 1)
+        # 索引 i+1 对应 tree_token[i] 的输出 (验证 children of tree_token[i])
+        target_logits = target_logits.squeeze(0)
+        device = target_logits.device
         
-        best_path_id = -1
-        best_s_fly = -1
-        best_path_data = None
-        device = target_logits_flat.device
+        selected_list = tree_data["selected_list"]
+        parent_idx_list = tree_data["parent_idx_list"]
+        token_id_list = tree_data["token_id_list"]
         
-        # 对每条路径执行 SPD+FLy
-        num_paths = retrieve_indices.shape[0]
-        for path_id in range(num_paths):
-            # 获取当前路径的索引（过滤掉 -1）
-            path_indices = retrieve_indices[path_id]
-            valid_mask = path_indices >= 0
-            path_indices = path_indices[valid_mask]
-            
-            if len(path_indices) == 0:
-                continue
-            
-            # 提取该路径的 draft tokens 和 target logits
-            path_draft_tokens = flat_tokens[path_indices]
-            path_target_logits = target_logits_flat[path_indices]
-            
-            # 确保是正确的形状
-            if path_draft_tokens.dim() == 0:
-                path_draft_tokens = path_draft_tokens.unsqueeze(0)
-            draft_token_ids = path_draft_tokens.unsqueeze(0)  # [1, k_path]
-            target_logits_k = path_target_logits.unsqueeze(0)  # [1, k_path, vocab_size]
-            
-            # SPD exact-match 验证
-            accepted, recovered_token_ids = self._batch_verification(
-                target_logits_k,
-                draft_token_ids,
-                temperature,
-            )
-            
-            # 记录应用 FLy 前的状态（用于统计）
-            accepted_before_fly = accepted.clone()
-            
-            # 应用熵门
-            if self.entropy_thre:
-                rej_mask = self.rej_by_entropy(accepted, target_logits_k, self.entropy_thre)
-            
-            # 应用 FLy 算法
-            if self.enable_fly:
-                # 只有当路径长度 >= win_len 时才应用 FLy
-                if accepted.shape[1] >= self.win_len:
-                    self.pattern = torch.ones(self.win_len, dtype=torch.bool, device=accepted.device)
-                    self.pattern[0] = False
-                    
-                    unfold_accept = accepted.unfold(1, self.win_len, 1)
-                    matched = torch.all(unfold_accept == self.pattern, dim=-1)
-                    
-                    updated_mask = torch.zeros_like(accepted, dtype=torch.bool, device=accepted.device)
-                    updated_mask[:, :matched.shape[1]] = matched
-                    updated_accept = accepted | updated_mask
-                    
-                    updated_accept[:, -self.win_len:] = updated_accept[:, -self.win_len:] & accepted[:, -self.win_len:]
-                    
-                    accepted = updated_accept
-            
-            if self.entropy_thre:
-                accepted = accepted & rej_mask
-            
-            if self.abla_no_window:
-                accepted = rej_mask
-            
-            # 计算该路径接受的 token 数
-            s_fly = accepted.sum().item()
-            
-            # 选择 s_fly 最大的路径
-            if s_fly > best_s_fly or (s_fly == best_s_fly and path_id == 0):
-                best_s_fly = s_fly
-                best_path_id = path_id
-                best_path_data = {
-                    'draft_token_ids': draft_token_ids,
-                    'target_logits_k': target_logits_k,
-                    'accepted': accepted,
-                    'accepted_before_fly': accepted_before_fly,
-                    'recovered_token_ids': recovered_token_ids,
-                }
+        T = len(selected_list)
+        if T == 0:
+            return None, None, None, None, -1
         
-        if best_path_data is None:
-            # 如果没有找到有效路径，返回空结果
-            return None, None, None, None, None
+        # 1. 构建 draft_tokens [T]
+        draft_tokens = torch.tensor([token_id_list[idx] for idx in selected_list], device=device)
         
-        # 注意：tree verify 模式下，我们没有计算 bonus token 的 logits
-        # 需要在主函数中单独计算 bonus logits
+        # 2. 确定每个 draft token 对应的 verification logit 索引
+        # verification logit 是其父节点的输出
+        node_to_position = {node_idx: pos for pos, node_idx in enumerate(selected_list)}
+        logit_indices = []
+        
+        for node_idx in selected_list:
+            parent_idx = parent_idx_list[node_idx]
+            if parent_idx == -1:
+                # 父节点是 Seed
+                logit_indices.append(0)
+            else:
+                # 父节点是 tree token
+                parent_pos = node_to_position[parent_idx]
+                logit_indices.append(parent_pos + 1) # +1 因为 target_logits[0] 是 seed
+                
+        logit_indices = torch.tensor(logit_indices, device=device, dtype=torch.long)
+        
+        # 3. Gather 对应的 logits [T, vocab_size]
+        verification_logits = target_logits[logit_indices]
+        
+        # 4. 采样 Target tokens
+        if temperature == 0:
+            target_tokens = verification_logits.argmax(dim=-1)
+        else:
+            probs = F.softmax(verification_logits / temperature, dim=-1)
+            target_tokens = torch.multinomial(probs, 1).squeeze(-1)
+            
+        # 5. 比较得到基础 acceptance
+        accepted_bool = (draft_tokens == target_tokens) # [T]
+        
+        # 6. 构建路径并应用 FLy
+         # 找到所有叶子节点（没有子节点的节点）
+        is_leaf = torch.ones(T, dtype=torch.bool, device=device)
+        for i, node_idx in enumerate(selected_list):
+            parent_idx = parent_idx_list[node_idx]
+            if parent_idx != -1 and parent_idx in node_to_position:
+                parent_pos = node_to_position[parent_idx]
+                is_leaf[parent_pos] = False
+        
+        leaf_indices = torch.nonzero(is_leaf, as_tuple=True)[0].tolist()
+        
+        # 构建所有路径
+        paths = []
+        max_len = 0
+        for leaf_pos in leaf_indices:
+            path = []
+            cur_pos = leaf_pos
+            cur_node_idx = selected_list[cur_pos]
+            while True:
+                path.append(cur_pos)
+                parent_idx = parent_idx_list[cur_node_idx]
+                if parent_idx == -1:
+                    break
+                if parent_idx not in node_to_position:
+                    break
+                cur_pos = node_to_position[parent_idx]
+                cur_node_idx = parent_idx
+            path.reverse()
+            paths.append(path)
+            max_len = max(max_len, len(path))
+            
+        if len(paths) == 0:
+            return None, None, None, None, -1
+
+        # 构建 Path Tensors
+        num_paths = len(paths)
+        path_accepted = torch.zeros((num_paths, max_len), dtype=torch.bool, device=device)
+        path_draft_tokens = torch.zeros((num_paths, max_len), dtype=torch.long, device=device)
+        path_target_tokens = torch.zeros((num_paths, max_len), dtype=torch.long, device=device)
+        path_valid_mask = torch.zeros((num_paths, max_len), dtype=torch.bool, device=device)
+        
+        for i, path in enumerate(paths):
+            path_len = len(path)
+            path_indices = torch.tensor(path, device=device, dtype=torch.long)
+            path_accepted[i, :path_len] = accepted_bool[path_indices]
+            path_draft_tokens[i, :path_len] = draft_tokens[path_indices]
+            path_target_tokens[i, :path_len] = target_tokens[path_indices]
+            path_valid_mask[i, :path_len] = True
+            
+        # 保存原始 accepted (用于统计)
+        accepted_before_fly = path_accepted.clone() & path_valid_mask
+
+        # 7. 应用 FLy 算法 (Pattern Matching)
+        if self.enable_fly and max_len >= self.win_len:
+            # self.pattern: [win_len] (False, True, True...)
+            if not hasattr(self, 'pattern') or self.pattern.device != device:
+                 self.pattern = torch.ones(self.win_len, dtype=torch.bool, device=device)
+                 self.pattern[0] = False
+            
+            # Unfold path_accepted: [num_paths, num_windows, win_len]
+            # 注意：unfold 会减少长度，只处理能完整覆盖窗口的部分
+            if max_len >= self.win_len:
+                # 为了处理变长路径，我们直接对整个 batch 操作，超出 valid_len 的部分是 False (0)，不会匹配全 1 (除非 pattern 全 0)
+                unfold_accept = path_accepted.unfold(1, self.win_len, 1) 
+                matched = torch.all(unfold_accept == self.pattern, dim=-1) # [num_paths, num_windows]
+                
+                updated_mask = torch.zeros_like(path_accepted, dtype=torch.bool, device=device)
+                updated_mask[:, :matched.shape[1]] = matched
+                
+                # 更新 accepted: 将匹配位置 (False) 变为 True
+                path_accepted = path_accepted | updated_mask
+                
+                # 保护逻辑: 最后 win_len 个位置不更新 (与原逻辑保持一致)
+                # 注意：这里只保护 valid_len 的末尾，但 Tensor 是 padded 的。
+                # 简化处理：只保护整个 tensor 的末尾（假设 max_len 足够长）
+                # 更严谨的做法是按每个 path 的 length 保护，但为了效率，这里先使用全局保护
+                # 或者我们只保护 matched 覆盖到的区域之后？
+                # 按照 FLy 原始逻辑：updated_accept[:, -self.win_len:] = updated_accept[:, -self.win_len:] & accepted[:, -self.win_len:]
+                path_accepted[:, -self.win_len:] = path_accepted[:, -self.win_len:] & accepted_before_fly[:, -self.win_len:]
+                
+        # 再次应用 valid mask 并计算 Causal Mask
+        path_accepted = path_accepted & path_valid_mask
+        cumulative_accepted = torch.cumprod(path_accepted.float(), dim=1).bool()
+        final_accepted = cumulative_accepted
+        
+        # 8. 选择最佳路径
+        accepted_lengths = final_accepted.sum(dim=1)
+        best_path_id = accepted_lengths.argmax().item()
+        best_len = accepted_lengths[best_path_id].item()
+        
+        # 提取最佳结果
+        # 如果 best_len == 0，需要返回空 tensor 避免后续 shape 错误
+        if best_len == 0:
+             best_draft = torch.empty((1, 0), dtype=torch.long, device=device)
+             best_target = torch.empty((1, 0), dtype=torch.long, device=device)
+             best_accepted_mask = torch.empty((1, 0), dtype=torch.bool, device=device)
+             best_accepted_before_fly_mask = torch.empty((1, 0), dtype=torch.bool, device=device)
+        else:
+            best_draft = path_draft_tokens[best_path_id, :best_len].unsqueeze(0)
+            best_target = path_target_tokens[best_path_id, :best_len].unsqueeze(0)
+            
+            # 注意：这里返回的 accepted 应该是 final_accepted (processed by FLy and Causal)
+            best_accepted_mask = final_accepted[best_path_id, :best_len].unsqueeze(0)
+            best_accepted_before_fly_mask = accepted_before_fly[best_path_id, :best_len].unsqueeze(0)
+        
         return (
-            best_path_data['draft_token_ids'],
-            best_path_data['accepted'],
-            best_path_data['accepted_before_fly'],
-            best_path_data['recovered_token_ids'],
-            None,  # 在 tree verify 模式下，bonus logits 需要单独计算
+            best_draft,
+            best_accepted_mask,
+            best_accepted_before_fly_mask,
+            best_target,
+            best_path_id
         )
 
 
@@ -1061,115 +1187,157 @@ class SPDGenerate:
         while (input_ids.shape[1] - init_len) < self.total_gen_tok:
             draft_round += 1
 
-            # self.cuslog.info(f"[{draft_round}]jz0803ngram is {self.use_ngram} InputIds>>> {self.decode_ids(input_ids[:,-20:])}")
-
             if self.tree_verify:
                 # Tree verify 模式：树形草稿生成 + 多路径验证
                 if self.verbose:
-                    self.cuslog.info(f"[Tree Verify] Starting tree draft generation with k={self.k}, branch_n={self.branch_n}")
-                tree_data = self.draft_with_tree(seed_for_next_d, past_kv_draft, temp=0)
+                    self.cuslog.info(f"[Tree Verify] Round {draft_round}: Starting tree draft generation")
                 
-                # 检查树生成是否成功
-                if tree_data['flat_tokens'].numel() == 0:
-                    raise ValueError("Tree generation failed: no nodes generated. Check branch_n and model configuration.")
+                # 准备树生成的输入
+                # seed_for_next_d 可能包含 1 或 2 个 tokens（取决于 bonus_tok_from_target）
+                # _last_accepted_tokens 是上一轮接受的 draft tokens（不含 bonus token）
+                accepted_tokens_for_tree = None
+                tree_seed = seed_for_next_d  # 默认使用 seed_for_next_d
+                
+                if hasattr(self, '_last_accepted_tokens') and self._last_accepted_tokens is not None:
+                    # 有上一轮接受的 tokens，需要合并
+                    if self.bonus_tok_from_target == 2:
+                        # seed_for_next_d 包含了两个 tokens（最后一个接受的 + bonus）
+                        # 我们需要：accepted_tokens + 这两个 tokens
+                        tree_seed = seed_for_next_d[:, -1:]  # 只取最后一个作为 seed
+                        accepted_tokens_for_tree = torch.cat([self._last_accepted_tokens, seed_for_next_d[:, :-1]], dim=1)
+                    else:
+                        # seed_for_next_d 只有一个 token（bonus）
+                        # 上一轮的 accepted tokens 已经在 KV cache 中了
+                        tree_seed = seed_for_next_d
+                        accepted_tokens_for_tree = self._last_accepted_tokens
+                
+                # 生成树，同时更新 KV cache
+                tree_data = self.draft_with_tree(
+                    tree_seed, 
+                    past_kv_draft, 
+                    temp=temperature,
+                    accepted_tokens=accepted_tokens_for_tree
+                )
+                
+                past_kv_draft = tree_data['updated_kv']
                 
                 if self.verbose:
-                    num_paths = tree_data['retrieve_indices'].shape[0]
+                    num_paths = len(tree_data.get('paths', []))
                     self.cuslog.info(f"[Tree Verify] Generated tree with {tree_data['flat_tokens'].numel()} nodes, {num_paths} paths")
                 
                 # 使用 tree attention 进行 target model forward
-                flat_tokens = tree_data['flat_tokens']  # torch.Tensor[T]
+                # 从 tree_data 中提取所有 selected_list 的 tokens
+                selected_list = tree_data['selected_list']
+                token_id_list = tree_data['token_id_list']
+                all_tree_tokens = [token_id_list[idx] for idx in selected_list]
+                
                 device = seed_for_next_t.device
+                num_tokens = len(all_tree_tokens)
                 
-                # 确保 flat_tokens 是正确的形状 [1, T]
-                if flat_tokens.dim() == 1:
-                    flat_tokens_tensor = flat_tokens.unsqueeze(0)  # [1, T]
-                else:
-                    flat_tokens_tensor = flat_tokens
+                # 将 tokens 转换为 tensor
+                flat_tokens_tensor = torch.tensor(all_tree_tokens, device=device, dtype=torch.long).unsqueeze(0)  # [1, num_tokens]
                 
-                # 将 seed_for_next_t 和 flat_tokens 拼接
-                target_in = torch.cat([seed_for_next_t, flat_tokens_tensor], dim=1)  # [1, 1+T]
+                # 将 seed_for_next_t 的最后一个 token 和 flat_tokens 拼接
+                # 只取最后一个 token，因为之前的 tokens 已经在 KV cache 中
+                seed_token = seed_for_next_t[:, -1:]  # [1, 1]
+                target_in = torch.cat([seed_token, flat_tokens_tensor], dim=1)  # [1, 1+num_tokens]
                 
                 # 获取 past_kv 的长度
                 past_kv_len = past_kv_target.get_seq_length() if past_kv_target is not None else 0
                 
-                # 当前输入的长度
-                current_len = target_in.shape[1]  # 1 + T
+                # 构建完整的 4D attention mask
+                # tree_data['attention_mask'] 的形状是 [1, 1, num_tokens, num_tokens]
+                tree_mask = tree_data['attention_mask']  # [1, 1, num_tokens, num_tokens]
                 
-                # 总序列长度 = past_kv_len + current_len
-                total_seq_len = past_kv_len + current_len
+                # 当前输入的长度 = 1 (seed) + num_tokens
+                current_len = 1 + num_tokens
+                total_len = past_kv_len + current_len
                 
-                # 为了简化，我们不使用自定义的 attention_mask
-                # 让模型使用默认的 causal mask，然后在验证阶段按路径处理
-                # 这样可以避免形状不匹配的问题
+                # 构建完整的 4D attention mask: [1, 1, total_len, total_len]
+                full_attention_mask = torch.full(
+                    (1, 1, total_len, total_len),
+                    float('-inf'),
+                    device=device,
+                    dtype=torch.float32
+                )
                 
-                # Target model forward（不使用自定义 attention_mask）
+                # KV cache 部分：标准 causal mask
+                for i in range(past_kv_len):
+                    for j in range(i + 1):
+                        full_attention_mask[0, 0, i, j] = 0.0
+                
+                # Seed token：可以看到所有 KV cache 和自己
+                for j in range(past_kv_len + 1):
+                    full_attention_mask[0, 0, past_kv_len, j] = 0.0
+                
+                # Tree tokens 部分
+                for i in range(num_tokens):
+                    # Tree token 可以看到所有 KV cache
+                    for j in range(past_kv_len):
+                        full_attention_mask[0, 0, past_kv_len + 1 + i, j] = 0.0
+                    
+                    # Tree token 可以看到 seed token
+                    full_attention_mask[0, 0, past_kv_len + 1 + i, past_kv_len] = 0.0
+                    
+                    # Tree token 之间根据 tree_mask 决定
+                    for j in range(num_tokens):
+                        if tree_mask[0, 0, i, j] > 0:
+                            full_attention_mask[0, 0, past_kv_len + 1 + i, past_kv_len + 1 + j] = 0.0
+                
+                # 创建 position_ids
+                position_ids = torch.arange(past_kv_len, past_kv_len + current_len, device=device, dtype=torch.long).unsqueeze(0)
+                
+                # Target model forward（使用 tree attention mask）
                 target_outputs = self.target_model(
-                    input_ids=target_in,  # [1, 1+T]
+                    input_ids=target_in,  # [1, 1+num_tokens]
+                    attention_mask=full_attention_mask,  # [1, 1, total_len, total_len]
+                    position_ids=position_ids,
                     past_key_values=past_kv_target,
                     use_cache=True,
                     return_dict=True,
-                    # 不传入 attention_mask，使用默认的 causal mask
                 )
                 
                 # 提取 flat_tokens 对应的 logits（跳过 seed token）
-                target_logits_flat = target_outputs.logits[:, 1:, :]  # [1, T, vocab_size]
-                target_logits_flat = target_logits_flat.squeeze(0)  # [T, vocab_size]
+                # target_logits_flat = target_outputs.logits[:, 1:, :]  # [1, T, vocab_size]
+                # target_logits_flat = target_logits_flat.squeeze(0)  # [T, vocab_size]
+                
+                # Pass full logits (including seed output) to verify_tree_paths
+                target_logits = target_outputs.logits  # [1, 1+T, vocab_size]
                 
                 # 在每条路径上执行 SPD+FLy，选择最佳路径
-                best_draft_tokens, best_accepted, best_accepted_before_fly, best_recovered, _ = self.verify_tree_paths(
-                    tree_data, target_logits_flat, temperature
+                best_draft_tokens, best_accepted, best_accepted_before_fly, best_recovered, best_path_id = self.verify_tree_paths(
+                    tree_data, target_logits, temperature
                 )
                 
-                # 检查是否找到有效路径
-                if best_draft_tokens is None:
-                    raise ValueError("Tree path verification failed: no valid path found. Check FLy and entropy threshold settings.")
                 
                 # 调试：打印接受情况
                 if self.verbose:
                     accepted_count = best_accepted.sum().item()
-                    self.cuslog.info(f"[Tree Verify] Path accepted {accepted_count}/{best_accepted.shape[1]} tokens, accepted mask: {best_accepted}")
+                    path_len = best_accepted.shape[1]
+                    self.cuslog.info(f"[Tree Verify] Best path {best_path_id}: accepted {accepted_count}/{path_len} tokens")
                 
-                # 为 bonus token 计算 logits
-                # 我们需要找到最后一个接受的位置，然后获取下一个位置的 logits
-                # 注意：target_outputs.logits 的形状是 [1, 1+T, vocab_size]
-                # 第0个位置对应seed token，第1到T个位置对应tree中的tokens
+                # 处理 bonus token
+                # bonus token 只有在所有 draft tokens 都被接受时才存在
+                # 此时 target_outputs.logits 的最后一个位置就是 bonus token 的 logits
+                bonus_token_ids = None
                 
-                # 找到最后一个接受的位置
                 if best_accepted.all():
-                    # 全部接受，bonus logits 在 target_outputs.logits 的最后一个位置后
-                    # 但是我们没有计算那个位置！需要重新计算
-                    last_accepted_idx = best_accepted.shape[1] - 1
+                    # 所有 draft tokens 都被接受，可以生成 bonus token
+                    # target_outputs.logits 的形状是 [1, 1+T, vocab_size]
+                    # 最后一个位置（索引 T）就是 bonus token 的 logits
+                    bonus_logits = target_outputs.logits[:, -1:, :]  # [1, 1, vocab_size]
+                    
+                    # 采样 bonus token
+                    if temperature == 0:
+                        bonus_token_ids = bonus_logits.argmax(dim=-1)  # [1, 1]
+                    else:
+                        bonus_token_ids = sample_with_temperature(bonus_logits, temperature, 1)  # [1, 1]
+                
+                # 找到最后一个接受的位置（用于后续处理）
+                
                 else:
                     # 找到第一个 False 的位置
                     first_reject_idx = (best_accepted == 0).max(1).indices.item()
-                    last_accepted_idx = first_reject_idx - 1 if first_reject_idx > 0 else -1
-                
-                # 生成 bonus token
-                # 为简化处理，我们直接使用 draft model 生成 bonus token
-                # 这里我们用 seed_for_next_t 和接受的 tokens 来计算
-                if last_accepted_idx >= 0:
-                    # 有接受的 tokens
-                    accepted_tokens = best_draft_tokens[:, :last_accepted_idx+1]  # [1, accepted_len]
-                    bonus_input = torch.cat([seed_for_next_t, accepted_tokens], dim=1)  # [1, 1+accepted_len]
-                else:
-                    # 没有接受任何 token，只用 seed
-                    bonus_input = seed_for_next_t  # [1, 1]
-                
-                # 使用 target model 计算 bonus logits
-                bonus_out = self.target_model(
-                    input_ids=bonus_input,
-                    past_key_values=past_kv_target,
-                    use_cache=False,  # 不更新 KV cache
-                    return_dict=True
-                )
-                bonus_logits = bonus_out.logits[:, -1:, :]  # [1, 1, vocab_size]
-                
-                # 采样 bonus token
-                if temperature == 0:
-                    bonus_token_ids = bonus_logits.argmax(dim=-1)  # [1, 1]
-                else:
-                    bonus_token_ids = sample_with_temperature(bonus_logits, temperature, 1)  # [1, 1]
                 
                 # 记录统计信息
                 if self.enable_statistics:
@@ -1225,7 +1393,9 @@ class SPDGenerate:
             # 非 tree_verify 模式的原有逻辑
             if not self.tree_verify:
                 # 将 seed token 和 draft tokens 拼接作为 target model 的输入
-                target_in = torch.cat([seed_for_next_t, draft_token_ids], dim=1)  # [1, k+1]
+                # 只取 seed_for_next_t 的最后一个 token，因为之前的 tokens 已经在 KV cache 中
+                seed_token = seed_for_next_t[:, -1:]  # [1, 1]
+                target_in = torch.cat([seed_token, draft_token_ids], dim=1)  # [1, k+1]
                 
                 # Target model forward
                 target_outputs = self.target_model(
@@ -1333,50 +1503,36 @@ class SPDGenerate:
                     past_kv_draft.crop(int(input_ids.shape[1]-1))
                     seed_for_next_d = input_ids[:,-1:]
             else:
-                # tree_verify 模式：需要正确更新 KV cache
-                # 根据 newly_input_ids 的长度来决定
+                # tree_verify 模式下的 KV cache 管理
                 newly_len = newly_input_ids.shape[1]
                 if self.verbose:
                     self.cuslog.info(f"[Tree Verify] Generated {newly_len} new tokens in this round")
                 
-                # tree_verify 模式下，需要更新 past_kv_draft
-                # 计算实际接受的 draft token 数（不包括 bonus token）
-                actual_draft_accepted = 0
+                # 计算实际接受的 token 数
+                actual_accepted = 0
                 if accepted.all():
-                    actual_draft_accepted = accepted.shape[1]  # 全部接受
+                    actual_accepted = accepted.shape[1]  # 全部接受
                 else:
                     # 找到第一个 False 的位置
-                    first_false = (accepted == 0).max(1).indices.item()
-                    actual_draft_accepted = first_false
+                    first_false_idx = (accepted == 0).max(1).indices.item()
+                    actual_accepted = first_false_idx
                 
-                if self.verbose:
-                    self.cuslog.info(f"[Tree Verify] Actual draft accepted: {actual_draft_accepted}, newly_len: {newly_len}")
-                
-                # 基于实际接受的 draft tokens 更新 KV cache
-                if actual_draft_accepted > 0:
-                    # 有接受的 draft tokens，更新 KV cache
-                    # 使用接受的 draft tokens（不是 newly_input_ids，因为它可能包含 recovered token）
-                    if best_draft_tokens is not None:
-                        accepted_draft = best_draft_tokens[:, :actual_draft_accepted]
-                        out_d = self.draft_model(
-                            input_ids=accepted_draft,
-                            use_cache=True,
-                            return_dict=True,
-                            past_key_values=past_kv_draft,
-                        )
-                        past_kv_draft = out_d.past_key_values
-                    
-                    # 如果接受了所有 draft tokens，bonus token 来自 target
-                    if accepted.all():
-                        self.bonus_tok_from_target = 2
-                        seed_for_next_d = input_ids[:,-2:]
-                    else:
-                        self.bonus_tok_from_target = 1
-                        seed_for_next_d = input_ids[:,-1:]
+                # 保存接受的 tokens，供下一轮使用
+                if actual_accepted > 0 and best_draft_tokens is not None:
+                    self._last_accepted_tokens = best_draft_tokens[:, :actual_accepted]
                 else:
-                    # 没有接受任何 draft token，past_kv_draft 保持不变
+                    self._last_accepted_tokens = None
+                
+                # 根据是否全部接受来决定下一轮的输入
+                # 注意：KV cache 更新已经在 draft_with_tree 的第一步完成了
+                if accepted.all():
+                    # 全部接受，下一轮从最后两个 token 开始（包括 bonus token）
+                    self.bonus_tok_from_target = 2
+                    seed_for_next_d = input_ids[:, -2:]
+                else:
+                    # 部分接受或没有接受，下一轮从最后一个 token 开始
                     self.bonus_tok_from_target = 1
-                    seed_for_next_d = input_ids[:,-1:]
+                    seed_for_next_d = input_ids[:, -1:]
 
             past_kv_target.crop(int(input_ids.shape[1] - 1))
             seed_for_next_t = input_ids[:,-1:]
@@ -1522,6 +1678,9 @@ class SPDGenerate:
         if self.enable_statistics:
             self.total_initial_mismatch = 0
             self.total_fly_accepted = 0
+        # 重置 tree_verify 相关状态
+        if self.tree_verify:
+            self._last_accepted_tokens = None
     
     def decode_ids(self, ids):
         token = self.tokenizer.decode(ids[0], skip_special_tokens=False)
