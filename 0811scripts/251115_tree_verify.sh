@@ -26,7 +26,7 @@ config_path="fly/FLy_Llama3_70b.json"
 task=humaneval_instruct
 
 # Output directory
-data=251115
+data=251121
 
 # Run evaluation with tree_verify enabled
 python -m lm_eval \
