@@ -815,7 +815,8 @@ class SPDGenerate:
             past_kv_draft.crop(original_kv_len)
             
             # 批量处理所有节点的 logits
-            all_logits = torch.cat(all_logits, dim=0)  # [num_nodes, vocab_size]
+            all_logits = torch.cat(all_logits, dim=0)  # [num_nodes, 1, vocab_size]
+            all_logits = all_logits.squeeze(1)         # [num_nodes, vocab_size]
             if temp > 0:
                 all_logits = all_logits / temp
             log_probs = F.log_softmax(all_logits, dim=-1)  # [num_nodes, vocab_size]
