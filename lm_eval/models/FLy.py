@@ -762,7 +762,7 @@ class SPDGenerate:
                 (1, 1, num_tokens, total_len),
                 float('-inf'),
                 device=device,
-                dtype=torch.float32
+                dtype=self.draft_model.dtype
             )
             
             # 4.1. Tree tokens 之间的 mask 构建
@@ -792,7 +792,7 @@ class SPDGenerate:
             # Tree tokens 之间的可见性由 tree_mask 决定
             # tree_mask: [num_tokens, num_tokens] -> 1.0 表示可见
             # 我们需要将 1.0 映射为 0.0, 0.0 映射为 -inf
-            mask_val = torch.where(tree_mask > 0, 0.0, float('-inf'))
+            mask_val = torch.where(tree_mask > 0, 0.0, float('-inf')).to(self.draft_model.dtype)
             attention_mask[:, :, :, kv_len:] = mask_val.unsqueeze(0).unsqueeze(0)
             
             # 5. 创建 position_ids
@@ -1256,7 +1256,7 @@ class SPDGenerate:
                     (1, 1, current_len, total_len),
                     float('-inf'),
                     device=device,
-                    dtype=torch.float32
+                    dtype=self.target_model.dtype
                 )
                 
                 # 1. Seed token (index 0 in current_len, index past_kv_len in total_len)
@@ -1274,7 +1274,7 @@ class SPDGenerate:
                 # Tree tokens 之间的可见性
                 # tree_mask: [1, 1, num_tokens, num_tokens] -> 1.0 表示可见
                 # 需要将 1.0 映射为 0.0, 0.0 映射为 -inf
-                tree_mask_val = torch.where(tree_mask > 0, 0.0, float('-inf'))
+                tree_mask_val = torch.where(tree_mask > 0, 0.0, float('-inf')).to(self.target_model.dtype)
                 full_attention_mask[:, :, 1:, past_kv_len + 1:] = tree_mask_val
                 
                 # 创建 position_ids
@@ -1283,7 +1283,7 @@ class SPDGenerate:
                 # Target model forward（使用 tree attention mask）
                 target_outputs = self.target_model(
                     input_ids=target_in,  # [1, 1+num_tokens]
-                    attention_mask=full_attention_mask,  # [1, 1, total_len, total_len]
+                    attention_mask=full_attention_mask,  # [1, 1, current_len, total_len]
                     position_ids=position_ids,
                     past_key_values=past_kv_target,
                     use_cache=True,
@@ -1348,9 +1348,32 @@ class SPDGenerate:
                     best_accepted, best_recovered, best_draft_tokens, bonus_token_ids, update_counter=True
                 )
                 
-                # 更新 draft_token_ids 和 accepted 用于后续的 KV cache 管理
-                draft_token_ids = best_draft_tokens
-                accepted = best_accepted
+                # === Tree Verify 全军覆没的补救措施 ===
+                if newly_input_ids.shape[1] == 0:
+                    # 使用 Target Model 对 Seed 的输出（真实 logits）生成一个 token
+                    # target_logits[:, 0, :] 对应 Seed Token 的输出
+                    seed_logits = target_logits[:, 0, :]
+                    
+                    if temperature == 0:
+                        recovery_token = seed_logits.argmax(dim=-1, keepdim=True)
+                    else:
+                        recovery_token = sample_with_temperature(seed_logits.unsqueeze(1), temperature, 1)
+                    
+                    # 重新赋值 newly_input_ids，打破死循环
+                    newly_input_ids = recovery_token
+                    
+                    # 既然全军覆没，重置 accepted 相关状态
+                    draft_token_ids = recovery_token
+                    # 这里的 accepted 全为 True (因为是 target model 自己生成的)
+                    accepted = torch.ones_like(recovery_token, dtype=torch.bool)
+                    
+                    # 更新统计（如果需要的话，这里不算 mismatch，因为根本没 draft 成功）
+                    if self.verbose:
+                        self.cuslog.info("[Tree Verify] All paths rejected. Fallback to Target Model generation.")
+                else:
+                    # 正常更新 draft_token_ids 和 accepted 用于后续的 KV cache 管理
+                    draft_token_ids = best_draft_tokens
+                    accepted = best_accepted
                 current_k = draft_token_ids.shape[1]
                 
                 if self.verbose:
