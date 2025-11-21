@@ -351,6 +351,10 @@ class SPDGenerate:
         batch_size, k = substitute_token_ids.shape
         
         # Determine the index of the first False value for each row.
+        # 如果 accepted 为空 (k=0)，直接返回空 output (不含 bonus token 也不可能生成，除非逻辑允许)
+        if k == 0:
+             return torch.empty((batch_size, 0), dtype=self.token_id_dtype, device=accepted.device)
+
         limits = (accepted == 0).max(1).indices
         limits[~(accepted == 0).any(1)] = k
 
