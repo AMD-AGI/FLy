@@ -3,12 +3,12 @@ requires = ["setuptools>=40.8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lm_eval"
-version = "0.4.9.1"
+name = "fly"
+version = "0.1.0"
 authors = [
-    {name="EleutherAI", email="contact@eleuther.ai"}
+    {name="Jinze Li"}
 ]
-description = "A framework for evaluating language models"
+description = "FLy: Training-Free Loosely Speculative Decoding, built on lm-evaluation-harness"
 readme = "README.md"
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -42,19 +42,18 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["lm_eval*"]
+include = ["fly*"]
 
 # required to include yaml files in pip installation
 [tool.setuptools.package-data]
-lm_eval = ["**/*.yaml", "tasks/**/*"]
+fly = ["**/*.yaml", "tasks/**/*"]
 
 [project.scripts]
-lm-eval = "lm_eval.__main__:cli_evaluate"
-lm_eval = "lm_eval.__main__:cli_evaluate"
+fly = "fly.__main__:cli_evaluate"
 
 [project.urls]
 Homepage = "https://github.com/EleutherAI/lm-evaluation-harness"
-Repository = "https://github.com/EleutherAI/lm-evaluation-harness"
+Upstream = "https://github.com/EleutherAI/lm-evaluation-harness"
 
 [project.optional-dependencies]
 acpbench = ["lark>=1.1.9", "tarski[clingo]==0.8.2", "pddl==0.4.2", "kstar-planner==1.4.2"]
@@ -86,15 +85,15 @@ vllm = ["vllm>=0.4.2"]
 wandb = ["wandb>=0.16.3", "pandas", "numpy"]
 zeno = ["pandas", "zeno-client"]
 tasks = [
-    "lm_eval[acpbench]",
-    "lm_eval[ifeval]",
-    "lm_eval[japanese_leaderboard]",
-    "lm_eval[longbench]",
-    "lm_eval[libra]",
-    "lm_eval[mamba]",
-    "lm_eval[math]",
-    "lm_eval[multilingual]",
-    "lm_eval[ruler]",
+    "fly[acpbench]",
+    "fly[ifeval]",
+    "fly[japanese_leaderboard]",
+    "fly[longbench]",
+    "fly[libra]",
+    "fly[mamba]",
+    "fly[math]",
+    "fly[multilingual]",
+    "fly[ruler]",
 ]
 
 [tool.pymarkdown]
@@ -110,7 +109,7 @@ extend-select = ["I", "W605"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
-known-first-party = ["lm_eval"]
+known-first-party = ["fly"]
 
 [tool.ruff.lint.extend-per-file-ignores]
 "__init__.py" = ["F401","F402","F403"]

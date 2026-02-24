@@ -37,7 +37,7 @@ temp/
 test_logs/
 
 # Caching
-lm_eval/caching/.cache
+fly/caching/.cache
 lm_cache/
 
 # Logging
