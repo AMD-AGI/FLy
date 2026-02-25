@@ -2,8 +2,6 @@ import copy
 import logging
 import os
 import json
-os.environ["HF_TOKEN"] = "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" 
-# os.environ["HF_TOKEN"] = "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"
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -42,20 +40,10 @@ from fly.models.utils import (
     stop_sequences_criteria,
 )
 
-#jz0728
-# from fly.models.revise_decoding import SPDGenerate
-# from fly.models.revise_decoding_new import SPDGenerate
-# from fly.models.revise_decoding_show_one_example import SPDGenerate
-# from fly.models.revise_decoding_walltime import SPDGenerate
 from fly.models.FLy import SPDGenerate
 
-# sys.path.insert(0, "/workspace/EAGLE")
-# from eagle.model.ea_model import EaModel
 import sys
 import os
-# sys.path.insert(0, "/workspace/Spec-Bench")
-
-# from fly.models.spec_bench_method import SpecBenchMethod
 
 import time
  
@@ -66,14 +54,8 @@ if TYPE_CHECKING:
 
 eval_logger = logging.getLogger(__name__)
 
-# jz0912
 import re
 def split_by_seed_marker(pattern, text):
-    """
-    在 text 中查找 'Here is the completed function:'，
-    返回 (seed前的字符串, seed后的字符串)
-    如果找不到则第二部分返回空字符串。
-    """
     m = re.search(pattern, text)
     if not m:
         eval_logger.warning(f"No {pattern} in the {text}")
@@ -158,14 +140,12 @@ class HFLM(TemplateLM):
                                  f"JSON value: {json_config[key]} -> kwargs value: {kwargs[key]}")
         self.json_config = json_config
 
-        # 打印最终使用的配置（更新后的配置）
         eval_logger.info("=" * 80)
         eval_logger.info("Final Configuration (after kwargs updates):")
         eval_logger.info("=" * 80)
         eval_logger.info(json.dumps(json_config, indent=2, ensure_ascii=False))
         eval_logger.info("=" * 80)
 
-        # jz0728
         self.target_model_path = json_config["target_model_path"]
         self.use_sd = json_config["use_sd"]
         self.is_qwen = json_config["is_qwen"]
@@ -398,8 +378,7 @@ class HFLM(TemplateLM):
             eval_logger.info(
                 f"Loglikelihood prefix token id used in evaluation: {self.prefix_token_id}"
             )
-        
-        # jz0728
+
         if self.use_sd:
             eval_logger.info(f"use_sd is True")
             spd_args = {
@@ -413,8 +392,7 @@ class HFLM(TemplateLM):
                 "num_ngram_pred_tokens":self.json_config["num_ngram_pred_tokens"],
                 "verbose":self.json_config["verbose"],
                 "abla_no_window":self.json_config["abla_no_window"],
-                "enable_statistics":enable_statistics,  # 指标统计开关，从命令行参数传入，默认关闭
-                # Tree verify 相关参数
+                "enable_statistics":enable_statistics,
                 "tree_verify":self.json_config.get("tree_verify", False),
                 "branch_n":self.json_config.get("branch_n", 10),
                 "max_nodes_per_level":self.json_config.get("max_nodes_per_level", 10),
@@ -426,8 +404,6 @@ class HFLM(TemplateLM):
             else:
                 self.spd_gen = SPDGenerate(self.model, self.target_model, self.tokenizer, eval_logger, spd_args)
 
-        # jz0806
-        
         elif self.use_eagle3 or self.use_eagle2:
             eval_logger.info(f"use_eagle3 is {self.use_eagle3}, use_eagle2 is {self.use_eagle2}")
             
@@ -750,7 +726,6 @@ class HFLM(TemplateLM):
         # These parameters are handled in __init__ and stored in self.json_config
         custom_params = set(self.json_config.keys()) if hasattr(self, 'json_config') else set()
         custom_params.add('config_path')  # Also filter out config_path
-        # Tree verify 相关参数也不应该传递给模型初始化
         custom_params.update(['tree_verify', 'branch_n', 'max_nodes_per_level', 'max_nodes_global'])
         for param in custom_params:
             model_kwargs.pop(param, None)  # Remove if exists, ignore if not
@@ -778,7 +753,6 @@ class HFLM(TemplateLM):
                             model_kwargs["bnb_4bit_compute_dtype"]
                         )
 
-            # jz0819
             draft_model_kwargs = copy.deepcopy(model_kwargs)
             draft_model_kwargs["device_map"] = {"":0}
             self._model = self.AUTO_MODEL_CLASS.from_pretrained(
@@ -788,10 +762,6 @@ class HFLM(TemplateLM):
                 trust_remote_code=trust_remote_code,
                 **draft_model_kwargs,
             )
-            # jz0728
-            # print(f"{revision=}")
-            # print(f"{model_kwargs=}")
-            # print(f"{subfolder=}")
             if self.use_sd or len(self.spec_bench_method)>0:
 
                 if self.spec_bench_method == "lookahead":
@@ -1158,7 +1128,6 @@ class HFLM(TemplateLM):
                 **generation_kwargs,
             )
 
-    # jz0728
     def _model_generate_sd(self, context, max_length, stop, attention_mask=None, input_context_for_dualtok=None, **generation_kwargs):
         stopping_criteria = stop_sequences_criteria(
             self.tokenizer, stop, context.shape[1], context.shape[0]
@@ -1190,8 +1159,6 @@ class HFLM(TemplateLM):
 
         return out_ids
 
-
-    # jz0806
     def _model_generate_eagle(self, context, max_length, stop, **generation_kwargs):
         torch.cuda.synchronize()
         start_time = time.time()
@@ -1667,8 +1634,6 @@ class HFLM(TemplateLM):
                 max_ctx_len = self.max_length
 
             # encode, pad, and truncate contexts for this batch
-            # print(f"Before >>> {contexts=}")  # jz0912
-            
             if self.json_config['dual_tok']:
                 # currently only for HumanEval
                 pattern = "Here is the completed function"
@@ -1689,11 +1654,6 @@ class HFLM(TemplateLM):
                 else:
                     contexts = (contexts + assis_cont,)
 
-            # print(f"After >>> {contexts=}")  # jz0912
-            # print(f"{self.draft_tokenizer.eos_token}")
-            # print(f"{self.target_tokenizer.eos_token}")
-
-
             context_enc, attn_masks, original_input_ids = self.tok_batch_encode(
                 contexts,
                 left_truncate_len=max_ctx_len,
@@ -1703,16 +1663,9 @@ class HFLM(TemplateLM):
             attn_masks = attn_masks.to(self.device)
             original_input_ids = original_input_ids.to(self.device)
 
-            # jz0912
-            # test_ids = self.tokenizer(contexts, add_special_tokens=False, return_tensors="pt")
-            # print(f"{test_ids['input_ids']=}")
-            # print(f"{context_enc=}")
-            # raise ValueError
-
             if "max_length" not in kwargs:
                 kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
 
-            # jz0728
             if self.use_sd:
                 if self.json_config['dual_tok']:
                     input_context_for_dualtok = (user_cont, assis_cont)
@@ -1789,8 +1742,7 @@ class HFLM(TemplateLM):
         res = re_ords.get_original(res)
 
         pbar.close()
-        
-        # 如果启用了统计，在数据集评估完成后打印全局统计
+
         if self.use_sd and hasattr(self, 'spd_gen') and self.spd_gen.enable_statistics:
             self.spd_gen.print_global_statistics()
 
