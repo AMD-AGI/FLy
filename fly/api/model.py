@@ -406,8 +406,7 @@ class TemplateLM(LM):
         This method sets the tokenizer's chat_template and returns the template string for reproducibility.
 
         The template selection logic is adapted from the Transformers library's `apply_chat_template`
-        method in the Tokenizer class. The original implementation can be found at:
-        https://github.com/huggingface/transformers/blob/fc35907f95459d7a6c5281dfadd680b6f7b620e3/src/transformers/tokenization_utils_base.py#L1687
+        method in the Tokenizer class.
 
         This method ensures that the right template is chosen based on the following:
         0. If the model has no 'tokenizer' attribute: assumes that there is only a single possible chat template, handled on the model provider side internally. Returns the empty string.

@@ -87,8 +87,6 @@ def bleu(items):
     n-grams in the candidate translation to n-grams in the reference text, where
     1-gram or unigram would be each token and a bigram comparison would be each
     word pair. The comparison is made regardless of word order
-    Source: https://machinelearningmastery.com/calculate-bleu-score-for-text-python/
-    Paper: https://www.aclweb.org/anthology/P02-1040/
 
     Higher is better
     """
@@ -102,8 +100,6 @@ def bleu(items):
 def chrf(items):
     """chrF++ is a tool for automatic evaluation of machine translation output
     based on character n-gram precision and recall enhanced with word n-grams.
-    Source: https://github.com/m-popovic/chrF
-    Paper: https://www.aclweb.org/anthology/W15-3049.pdf
 
     Higher is better  # TODO I think
     """
@@ -118,8 +114,6 @@ def ter(items):
     """Translation Error Rate is an error metric for machine translation that
     measures the number of edits required to change a system output into one
     of the references
-    Source: http://www.cs.umd.edu/~snover/tercom/
-    Paper: http://mt-archive.info/AMTA-2006-Snover.pdf
 
     Lower is better
     """
@@ -180,17 +174,12 @@ def acc_mutual_info_fn(items):  # This is a passthrough function
 
 
 ### the code used in the `exact_match_hf_evaluate` function is ported from
-### https://github.com/huggingface/evaluate/blob/main/metrics/exact_match/exact_match.py
-### which is under the apache license.
+### the huggingface evaluate library, which is under the apache license.
 
 # Copyright 2020 The HuggingFace Datasets Authors and the current dataset script contributor.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-#     http://www.apache.org/licenses/LICENSE-2.0
-
 
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -574,8 +563,6 @@ def pooled_sample_stderr(stderrs: List[float], sizes: List[int]):
 
     assert len(stderrs) == len(sizes)
 
-    # formula source: https://en.wikipedia.org/wiki/Pooled_variance
-    # and: https://stats.stackexchange.com/a/4841331
     # this empirically seems to match running `stderr_for_metric` on all instances
     # from the subtasks concatenated with each other.
     pooled_sample_var = (
@@ -591,7 +578,6 @@ def combined_sample_stderr(stderrs: List[float], sizes: List[int], metrics=None)
     )
     assert len(stderrs) == len(sizes) and len(sizes) == len(metrics)
 
-    # See https://github.com/EleutherAI/lm-evaluation-harness/pull/1390 for more documentation.
     # This formula depends on sample means.
     # removed because it seems to give erroneously huge stderrs for groupings of tasks
     # and does not seem to match up with bootstrap-calculated stderrs for groups.

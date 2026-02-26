@@ -184,7 +184,6 @@ class MultiChoiceRegexFilter(RegexFilter):
                 st = st.lower()
 
             if self.ignore_punctuation:
-                # https://stackoverflow.com/a/266162
                 st = st.translate(punct_tbl)
             return st
 

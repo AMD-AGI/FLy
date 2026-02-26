@@ -274,7 +274,7 @@ def stop_sequences_criteria(
 
 def undistribute(iterable):
     """
-    Undoes https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.distribute .
+    Undoes more_itertools.distribute.
 
     Re-interleaves results that have been split using more_itertools.distribute:
         >>> group_1, group_2 = distribute(2, [1, 2, 3, 4, 5, 6])
@@ -665,7 +665,6 @@ def configure_pad_token(
             # The additional tokenizer name check is needed, as there exists rwkv4 models with neox tokenizer
             # ---
             # Note that the world tokenizer class name, might change in the future for the final huggingface merge
-            # https://github.com/huggingface/transformers/pull/26963
             assert tokenizer.pad_token_id == 0
         else:
             tokenizer.add_special_tokens({"pad_token": "<|pad|>"})

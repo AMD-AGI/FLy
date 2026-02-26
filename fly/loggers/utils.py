@@ -85,7 +85,6 @@ def get_commit_from_path(repo_path: Union[Path, str]) -> Optional[str]:
 def get_git_commit_hash():
     """
     Gets the git commit hash of your current repo (if it exists).
-    Source: https://github.com/EleutherAI/gpt-neox/blob/b608043be541602170bfcfb8ec9bf85e8a0799e0/megatron/neox_arguments/neox_args.py#L42
     """
     try:
         git_hash = subprocess.check_output(["git", "describe", "--always"]).strip()

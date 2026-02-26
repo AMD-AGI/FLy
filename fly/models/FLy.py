@@ -255,9 +255,6 @@ class SPDGenerate:
         (f(x))_+ = \frac{\max(0, f(x))}{\sum_x \max(0, f(x))}
         $$
 
-        See https://github.com/vllm-project/vllm/pull/2336 for a visualization
-        of the draft, target, and recovered probability distributions.
-
         Returns a tensor of shape [batch_size, k, vocab_size].
 
         Note: 
@@ -292,7 +289,6 @@ class SPDGenerate:
 
         Note that this isn't actually the smallest positive value representable
         by float32, but the smallest positive normal value.
-        See https://en.wikipedia.org/wiki/Subnormal_number for more information.
         """
         return torch.finfo(self.probs_dtype).tiny
 
