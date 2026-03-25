@@ -13,6 +13,6 @@ CONFIG_PATH="fly_config/FLy_Llama3_70b.json"
 
 fly --model hf \
     --model_args pretrained=${DRAFT_MODEL},config_path=${CONFIG_PATH} \
-    --tasks humaneval \
+    --tasks humaneval_instruct \
     --batch_size 1 \
     --confirm_run_unsafe_code

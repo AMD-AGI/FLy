@@ -88,7 +88,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "-a",
         default="",
         type=try_parse_json,
-        help="""Comma separated string or JSON formatted arguments for model, e.g. `pretrained=EleutherAI/pythia-160m,dtype=float32` or '{"pretrained":"EleutherAI/pythia-160m","dtype":"float32"}'""",
+        help="""Comma separated string or JSON formatted arguments for model, e.g. `pretrained=<hf_model_id_or_path>,dtype=float32` or '{"pretrained":"<hf_model_id_or_path>","dtype":"float32"}'""",
     )
     parser.add_argument(
         "--num_fewshot",
@@ -249,7 +249,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--hf_hub_log_args",
         type=str,
         default="",
-        help="Comma separated string arguments passed to Hugging Face Hub's log function, e.g. `hub_results_org=EleutherAI,hub_repo_name=fly-results`",
+        help="Comma separated string arguments passed to Hugging Face Hub's log function, e.g. `hub_results_org=jinze,hub_repo_name=fly-results`",
     )
     parser.add_argument(
         "--predict_only",

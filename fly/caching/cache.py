@@ -10,13 +10,16 @@ eval_logger = logging.getLogger(__name__)
 
 MODULE_DIR = os.path.dirname(os.path.realpath(__file__))
 
-OVERRIDE_PATH = os.getenv("LM_HARNESS_CACHE_PATH")
+OVERRIDE_PATH = (
+    os.getenv("FLY_CACHE_PATH")
+    or os.getenv("JINZE_FLY_CACHE_PATH")
+)
 
 
 PATH = OVERRIDE_PATH if OVERRIDE_PATH else f"{MODULE_DIR}/.cache"
 
 # This should be sufficient for uniqueness
-HASH_INPUT = "EleutherAI-lm-evaluation-harness"
+HASH_INPUT = "jinze-fly"
 
 HASH_PREFIX = hashlib.sha256(HASH_INPUT.encode("utf-8")).hexdigest()
 

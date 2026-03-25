@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=40.8.0", "wheel"]
+requires = ["setuptools>=64.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,7 @@ version = "0.1.0"
 authors = [
     {name="Jinze Li"}
 ]
-description = "FLy: Training-Free Loosely Speculative Decoding, built on lm-evaluation-harness"
+description = "FLy: Training-Free Loosely Speculative Decoding evaluation toolkit"
 readme = "README.md"
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -20,25 +20,31 @@ requires-python = ">=3.9"
 license = { "text" = "MIT" }
 dependencies = [
     "accelerate>=0.26.0",
-    "evaluate",
-    "datasets>=2.16.0,<4.0",
+    "datasets>=2.16.0",
+    "dill",
     "evaluate>=0.4.0",
+    "huggingface_hub>=0.20.0",
+    "jinja2>=3.1.0",
     "jsonlines",
+    "more_itertools",
+    "numpy",
     "numexpr",
-    "peft>=0.2.0",
+    "packaging",
+    "pandas",
+    "peft>=0.4.0",
     "pybind11>=2.6.2",
     "pytablewriter",
+    "pyyaml>=6.0",
     "rouge-score>=0.0.4",
     "sacrebleu>=1.5.0",
     "scikit-learn>=0.24.1",
     "sqlitedict",
-    "torch>=1.8",
+    "torch>=2.1",
+    "tqdm",
     "tqdm-multiprocess",
-    "transformers>=4.1",
-    "zstandard",
-    "dill",
+    "transformers>=4.45.0,<5",
     "word2number",
-    "more_itertools",
+    "zstandard",
 ]
 
 [tool.setuptools.packages.find]
@@ -51,15 +57,11 @@ fly = ["**/*.yaml", "tasks/**/*"]
 [project.scripts]
 fly = "fly.__main__:cli_evaluate"
 
-[project.urls]
-Homepage = "https://github.com/EleutherAI/lm-evaluation-harness"
-Upstream = "https://github.com/EleutherAI/lm-evaluation-harness"
-
 [project.optional-dependencies]
 acpbench = ["lark>=1.1.9", "tarski[clingo]==0.8.2", "pddl==0.4.2", "kstar-planner==1.4.2"]
 api = ["requests", "aiohttp", "tenacity", "tqdm", "tiktoken"]
 audiolm_qwen = ["librosa", "soundfile"]
-dev = ["pytest", "pytest-cov", "pytest-xdist", "pre-commit", "requests", "aiohttp", "tenacity", "tqdm", "tiktoken", "sentencepiece"]
+dev = ["pytest", "pytest-cov", "pytest-xdist", "pre-commit", "requests", "aiohttp", "tenacity", "tqdm", "tiktoken", "sentencepiece", "ruff"]
 gptq = ["auto-gptq[triton]>=0.6.0"]
 gptqmodel = ["gptqmodel>=1.0.9"]
 hf_transfer = ["hf_transfer"]
@@ -117,5 +119,7 @@ known-first-party = ["fly"]
 
 [dependency-groups]
 dev = [
-  "api","dev","sentencepiece"
+  "fly[api]",
+  "fly[dev]",
+  "fly[sentencepiece]"
 ]

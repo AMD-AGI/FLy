@@ -2,7 +2,7 @@ import logging
 import os
 
 
-__version__ = "0.4.9.1"
+__version__ = "0.1.0"
 
 
 # Lazy-load .evaluator module to improve CLI startup

@@ -1,8 +1,8 @@
+import json
 import copy
 import logging
 import os
-import json
-import sys
+import re
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
@@ -42,19 +42,12 @@ from fly.models.utils import (
 
 from fly.models.FLy import SPDGenerate
 
-import sys
-import os
-
-import time
- 
-
-
 if TYPE_CHECKING:
     from transformers.quantizers import AutoQuantizationConfig
 
 eval_logger = logging.getLogger(__name__)
 
-import re
+
 def split_by_seed_marker(pattern, text):
     m = re.search(pattern, text)
     if not m:
@@ -148,11 +141,6 @@ class HFLM(TemplateLM):
 
         self.target_model_path = json_config["target_model_path"]
         self.use_sd = json_config["use_sd"]
-        self.is_qwen = json_config["is_qwen"]
-        self.use_eagle2 = json_config["use_eagle2"]
-        self.use_eagle3 = json_config["use_eagle3"]
-        self.spec_bench_method = json_config["spec_bench_method"]
-        self.enable_thinking = json_config["enable_qwen_thinking"]
         self.temperature = json_config["temperature"]
         self.pretrained = pretrained
         
@@ -404,43 +392,6 @@ class HFLM(TemplateLM):
             else:
                 self.spd_gen = SPDGenerate(self.model, self.target_model, self.tokenizer, eval_logger, spd_args)
 
-        elif self.use_eagle3 or self.use_eagle2:
-            eval_logger.info(f"use_eagle3 is {self.use_eagle3}, use_eagle2 is {self.use_eagle2}")
-            
-            self.totaltoken_list = []
-            self.totaltime_list = []
-            self.round_list = []
-            
-
-            if self.use_eagle3:
-                use_eagle3 = True
-            elif self.use_eagle2:
-                use_eagle3 = False
-
-
-            self.eagle_model = EaModel.from_pretrained(
-                                base_model_path=self.target_model_path,
-                                ea_model_path=self.json_config["ea_model_path"],
-                                total_token=48,
-                                depth=6,
-                                top_k=10,
-                                torch_dtype=torch.bfloat16,
-                                low_cpu_mem_usage=True,
-                                device_map="auto",
-                                use_eagle3=use_eagle3,
-                            )
-        elif len(self.spec_bench_method) > 0:
-
-            self.totaltoken_list = []
-            self.totaltime_list = []
-            self.round_list = []
-
-            self.sb = SpecBenchMethod(self.spec_bench_method, self.target_model, self.tokenizer, total_gen_tok, self.target_model.device)
-
-
-
-
-
     def _get_accelerate_args(
         self,
         parallelize: Optional[bool] = None,
@@ -545,7 +496,7 @@ class HFLM(TemplateLM):
     @property
     def target_model(self):
         # returns the model, unwrapping it if using Accelerate
-        if self.use_sd or len(self.spec_bench_method)>0:
+        if self.use_sd:
             if hasattr(self, "accelerator"):
                 return self.accelerator.unwrap_model(self._target_model)
             else:
@@ -762,14 +713,7 @@ class HFLM(TemplateLM):
                 trust_remote_code=trust_remote_code,
                 **draft_model_kwargs,
             )
-            if self.use_sd or len(self.spec_bench_method)>0:
-
-                if self.spec_bench_method == "lookahead":
-                    from model.lade.utils import augment_all, config_lade
-                    augment_all()
-                    config_lade(LEVEL=3, WINDOW_SIZE=10, GUESS_SET_SIZE=10, DEBUG=0,
-                                    USE_FLASH=0, DIST_WORKERS=len(os.environ.get("HIP_VISIBLE_DEVICES").split(",")))
-
+            if self.use_sd:
                 self._target_model = self.AUTO_MODEL_CLASS.from_pretrained(
                     self.target_model_path,
                     revision=revision,
@@ -1141,53 +1085,6 @@ class HFLM(TemplateLM):
             accepted_token = self.spd_gen.generate_chunks(context, self.temperature)
         _ = self.spd_gen.show_status()
         return accepted_token
-
-    def _model_generate_sb(self, context, max_length, stop, **generation_kwargs):
-        torch.cuda.synchronize()
-        start_time = time.time()
-        
-        with torch.autocast(
-            device_type=self.device.type,
-            dtype=self.mixed_precision_dtype,
-            enabled=self.mixed_precision_dtype is not None,
-        ):
-            out_ids, new_tok, idx_plus_1, acc_list = self.sb.generate(context)
-
-        torch.cuda.synchronize()
-        total_time = time.time() - start_time
-        self.collect_statistics(total_time,new_tok,idx_plus_1)
-
-        return out_ids
-
-    def _model_generate_eagle(self, context, max_length, stop, **generation_kwargs):
-        torch.cuda.synchronize()
-        start_time = time.time()
-        
-        with torch.inference_mode():
-            output_ids, new_token, idx = self.eagle_model.eagenerate(
-                    torch.as_tensor(context).cuda(),
-                    temperature=0,
-                    log=True,
-                    is_llama3=True,
-                    max_length=10240,
-                )
-
-        torch.cuda.synchronize()
-        total_time = time.time() - start_time
-        self.collect_statistics(total_time,new_token,idx)
-
-        return output_ids
-
-
-    def collect_statistics(self, total_time, new_token, idx):
-        self.totaltoken_list.append(int(new_token))
-        self.totaltime_list.append(total_time)
-        self.round_list.append(idx)
-
-        mat = sum(self.totaltoken_list) / sum(self.round_list)
-        speed = sum(self.totaltoken_list) / sum(self.totaltime_list)
-
-        eval_logger.info(f"Speed:{speed:.2f}|MAT:{mat:.2f}")
 
 
 
@@ -1654,14 +1551,13 @@ class HFLM(TemplateLM):
                 else:
                     contexts = (contexts + assis_cont,)
 
-            context_enc, attn_masks, original_input_ids = self.tok_batch_encode(
+            context_enc, attn_masks, _ = self.tok_batch_encode(
                 contexts,
                 left_truncate_len=max_ctx_len,
                 truncation=self.truncation,
             )
             context_enc = context_enc.to(self.device)
             attn_masks = attn_masks.to(self.device)
-            original_input_ids = original_input_ids.to(self.device)
 
             if "max_length" not in kwargs:
                 kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
@@ -1679,22 +1575,6 @@ class HFLM(TemplateLM):
                     input_context_for_dualtok=input_context_for_dualtok,
                     **kwargs,
                 )
-            elif self.use_eagle3 or self.use_eagle2:
-                cont = self._model_generate_eagle(
-                    context=context_enc,
-                    attention_mask=attn_masks,
-                    stop=until,
-                    **kwargs,
-                ) 
-            elif len(self.spec_bench_method) > 0:
-                cont = self._model_generate_sb(
-                    context=original_input_ids,
-                    attention_mask=attn_masks,
-                    stop=until,
-                    **kwargs,
-                )
-
-
             else:
                 # perform batched generation
                 cont = self._model_generate(
@@ -1755,22 +1635,6 @@ class HFLM(TemplateLM):
         Method to apply a chat template to a list of chat history between user and model.
         """
         try:
-            # if self.enable_thinking:
-            #     chat_templated = self.tokenizer.apply_chat_template(
-            #         chat_history,
-            #         tokenize=False,
-            #         add_generation_prompt=add_generation_prompt,
-            #         continue_final_message=not add_generation_prompt,
-            #     )
-            # else:
-            #     chat_templated = self.tokenizer.apply_chat_template(
-            #         chat_history,
-            #         tokenize=False,
-            #         add_generation_prompt=add_generation_prompt,
-            #         continue_final_message=not add_generation_prompt,
-            #         enable_thinking=False
-            #     )
-
             chat_templated = self.tokenizer.apply_chat_template(
                     chat_history,
                     tokenize=False,

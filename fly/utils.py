@@ -451,7 +451,7 @@ def positional_deprecated(fn):
             print(
                 f"WARNING: using {fn.__name__} with positional arguments is "
                 "deprecated and will be disallowed in a future version of "
-                "lm-evaluation-harness!"
+                "FLy!"
             )
         return fn(*args, **kwargs)
 
