@@ -1,4 +1,4 @@
-# FLy
+# FLy: Training-Free Loosely Speculative Decoding: Accepting Semantically Correct Drafts Beyond Exact Match (ICML 2026)
 
 FLy is a Training-Free Loosely Speculative Decoding library for evaluation workloads.
 
@@ -22,12 +22,13 @@ pip install -e .
 
 ## Usage
 
+Please reach to `start.sh` for the full example, or using the command below:
 ```bash
 export HF_ALLOW_CODE_EVAL=1
 
 fly --model hf \
     --model_args pretrained=<draft_model_path_or_hf_model_id>,config_path=fly_config/FLy_Llama3_70b.json \
-    --tasks humaneval \
+    --tasks humaneval_instruct \
     --batch_size 1 \
     --apply_chat_template \
     --confirm_run_unsafe_code
@@ -55,6 +56,13 @@ The example config `fly_config/FLy_Llama3_70b.json` loads both a draft model and
 
 Edit the JSON config in `fly_config/` to control speculative decoding behavior. See `fly_config/FLy_Llama3_70b.json` for an example.
 
-## License
+## Citation
 
-FLy includes or adapts code from the upstream project under the MIT License. See [LICENSE.md](LICENSE.md).
+```
+@article{li2025training,
+  title={Training-Free Loosely Speculative Decoding: Accepting Semantically Correct Drafts Beyond Exact Match},
+  author={Li, Jinze and Xu, Yixing and Li, Guanchen and Yang, Shuo and Xu, Jinfeng and Yin, Xuanwu and Li, Dong and Ngai, Edith CH and Barsoum, Emad},
+  journal={arXiv preprint arXiv:2511.22972},
+  year={2025}
+}
+```
