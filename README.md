@@ -15,7 +15,7 @@ This project is based on [EleutherAI's lm-evaluation-harness](https://github.com
 ## Installation
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/AMD-AGI/FLy.git
 cd FLy
 pip install -e .
 ```
