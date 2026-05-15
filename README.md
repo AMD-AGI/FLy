@@ -1,4 +1,4 @@
-# FLy: Training-Free Loosely Speculative Decoding: Accepting Semantically Correct Drafts Beyond Exact Match (ICML 2026)
+# FLy: Training-Free Loosely Speculative Decoding: Accepting Semantically Correct Drafts Beyond Exact Match (ICLR 2026)
 
 FLy is a Training-Free Loosely Speculative Decoding library for evaluation workloads.
 
